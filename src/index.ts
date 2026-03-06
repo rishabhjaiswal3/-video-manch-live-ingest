@@ -6,10 +6,11 @@ import type { IncomingMessage } from 'http';
 import type { Socket } from 'net';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
+import NodeMediaServer from 'node-media-server';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { RawData } from 'ws';
 
-interface ValidationResponse {
+interface WsValidationResponse {
   success: boolean;
   data?: {
     videoId: string;
@@ -23,8 +24,16 @@ interface ValidationResponse {
 const PORT = Number(process.env.PORT || 3001);
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.videomanch.com';
 const LIVE_INGEST_SHARED_SECRET = process.env.LIVE_INGEST_SHARED_SECRET || '';
+
+const ENABLE_WS_INGEST = process.env.ENABLE_WS_INGEST !== 'false';
+const ENABLE_RTMP_SERVER = process.env.ENABLE_RTMP_SERVER === 'true';
+
 const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
 const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 1024 * 1024);
+
+const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
+const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
+const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
 
 if (!LIVE_INGEST_SHARED_SECRET) {
   throw new Error('LIVE_INGEST_SHARED_SECRET is required');
@@ -37,6 +46,15 @@ app.get('/health', (_req: Request, res: Response) => {
     status: 'ok',
     service: 'video-manch-live-ingest',
     timestamp: new Date().toISOString(),
+    modes: {
+      wsIngest: ENABLE_WS_INGEST,
+      rtmpServer: ENABLE_RTMP_SERVER,
+    },
+    ports: {
+      http: PORT,
+      rtmp: ENABLE_RTMP_SERVER ? RTMP_PORT : null,
+      hlsHttp: ENABLE_RTMP_SERVER ? HLS_HTTP_PORT : null,
+    },
   });
 });
 
@@ -71,7 +89,7 @@ const ensureFfmpegAvailable = () => {
   log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
 };
 
-const validateIngestKey = async (videoId: string, key: string): Promise<ValidationResponse> => {
+const validateIngestKey = async (videoId: string, key: string): Promise<WsValidationResponse> => {
   const url = `${API_BASE_URL}/live/ingest/validate/${encodeURIComponent(videoId)}?key=${encodeURIComponent(key)}`;
   const response = await fetch(url, {
     method: 'GET',
@@ -85,7 +103,23 @@ const validateIngestKey = async (videoId: string, key: string): Promise<Validati
     return { success: false, error: `validate failed: ${response.status} ${text}` };
   }
 
-  return response.json() as Promise<ValidationResponse>;
+  return response.json() as Promise<WsValidationResponse>;
+};
+
+const validateRtmpStreamKey = async (streamKey: string) => {
+  const url = `${API_BASE_URL}/live/rtmp/validate/${encodeURIComponent(streamKey)}`;
+  const response = await fetch(url, {
+    headers: {
+      'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => 'unknown error');
+    return { success: false, error: `${response.status} ${text}` };
+  }
+
+  return response.json() as Promise<{ success: boolean; data?: any; error?: string }>;
 };
 
 const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNullStreams => {
@@ -159,6 +193,12 @@ const closeClient = (ws: WebSocket, code: number, reason: string) => {
 };
 
 server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buffer) => {
+  if (!ENABLE_WS_INGEST) {
+    socket.write('HTTP/1.1 503 Service Unavailable\\r\\n\\r\\n');
+    socket.destroy();
+    return;
+  }
+
   try {
     const parsed = new URL(request.url || '', `http://${request.headers.host}`);
     const match = parsed.pathname.match(/^\/live\/ingest\/([a-zA-Z0-9-]+)$/);
@@ -202,7 +242,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
   }
 });
 
-wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: ValidationResponse['data']) => {
+wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: WsValidationResponse['data']) => {
   if (!validationData) {
     ws.close(1011, 'missing validation data');
     return;
@@ -223,7 +263,6 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
     closeClient(ws, 1011, 'ffmpeg error');
   });
 
-  // Prevent process crash on broken pipe when ffmpeg exits/rtmp connect fails.
   ffmpeg.stdin.on('error', (error: NodeJS.ErrnoException) => {
     log('ffmpeg stdin error', {
       videoId,
@@ -248,10 +287,7 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
     const state = clients.get(ws);
     if (!state) return;
 
-    if (!isBinary) {
-      // Ignore text frames from browser extensions/clients.
-      return;
-    }
+    if (!isBinary) return;
 
     if (
       !state.ffmpeg.stdin.writable ||
@@ -263,11 +299,7 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 
     try {
       const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      const ok = state.ffmpeg.stdin.write(chunk);
-      if (!ok) {
-        // Backpressure: wait for drain before writing more chunks.
-        state.ffmpeg.stdin.once('drain', () => {});
-      }
+      state.ffmpeg.stdin.write(chunk);
     } catch (error: any) {
       log('Failed to write media chunk to ffmpeg stdin', {
         videoId: state.videoId,
@@ -292,10 +324,93 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   });
 });
 
+const startRtmpServer = () => {
+  if (!ENABLE_RTMP_SERVER) return;
+
+  const config = {
+    logType: 2,
+    rtmp: {
+      port: RTMP_PORT,
+      chunk_size: 60000,
+      gop_cache: true,
+      ping: 30,
+      ping_timeout: 60,
+    },
+    http: {
+      port: HLS_HTTP_PORT,
+      mediaroot: MEDIA_ROOT,
+      allow_origin: '*',
+    },
+    trans: {
+      ffmpeg: FFMPEG_BIN,
+      tasks: [
+        {
+          app: 'live',
+          hls: true,
+          hlsFlags: '[hls_time=2:hls_list_size=6:hls_flags=delete_segments]',
+          hlsKeep: false,
+        },
+      ],
+    },
+  };
+
+  const nms = new NodeMediaServer(config);
+
+  nms.on('prePublish', async (id: string, streamPath: string) => {
+    try {
+      const [, appName, streamKey] = streamPath.split('/');
+      if (appName !== 'live' || !streamKey) {
+        log('Rejecting RTMP publish - invalid stream path', { id, streamPath });
+        nms.getSession(id)?.reject();
+        return;
+      }
+
+      const validation = await validateRtmpStreamKey(streamKey);
+      if (!validation.success) {
+        log('Rejecting RTMP publish - stream validation failed', {
+          id,
+          streamPath,
+          error: validation.error || 'unknown',
+        });
+        nms.getSession(id)?.reject();
+        return;
+      }
+
+      log('RTMP publish accepted', {
+        id,
+        streamPath,
+        videoId: validation.data?.videoId,
+        masterPlaylistUrl: validation.data?.masterPlaylistUrl,
+      });
+    } catch (error: any) {
+      log('Rejecting RTMP publish - exception during validation', {
+        id,
+        streamPath,
+        message: error?.message,
+      });
+      nms.getSession(id)?.reject();
+    }
+  });
+
+  nms.on('donePublish', (id: string, streamPath: string) => {
+    log('RTMP publish stopped', { id, streamPath });
+  });
+
+  nms.run();
+  log('RTMP server started', {
+    rtmpPort: RTMP_PORT,
+    hlsHttpPort: HLS_HTTP_PORT,
+    mediaRoot: MEDIA_ROOT,
+  });
+};
+
 server.listen(PORT, '0.0.0.0', () => {
   ensureFfmpegAvailable();
+  startRtmpServer();
   log('Live ingest service started', {
     port: PORT,
     apiBaseUrl: API_BASE_URL,
+    enableWsIngest: ENABLE_WS_INGEST,
+    enableRtmpServer: ENABLE_RTMP_SERVER,
   });
 });
