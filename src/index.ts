@@ -223,6 +223,17 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
     closeClient(ws, 1011, 'ffmpeg error');
   });
 
+  // Prevent process crash on broken pipe when ffmpeg exits/rtmp connect fails.
+  ffmpeg.stdin.on('error', (error: NodeJS.ErrnoException) => {
+    log('ffmpeg stdin error', {
+      videoId,
+      message: error.message,
+      code: error.code,
+      syscall: error.syscall,
+    });
+    closeClient(ws, 1011, 'ffmpeg stdin error');
+  });
+
   const pingTimer = setInterval(() => {
     if (ws.readyState === ws.OPEN) {
       ws.ping();
@@ -242,13 +253,21 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
       return;
     }
 
-    if (!state.ffmpeg.stdin.writable) {
+    if (
+      !state.ffmpeg.stdin.writable ||
+      state.ffmpeg.stdin.destroyed ||
+      state.ffmpeg.stdin.writableEnded
+    ) {
       return;
     }
 
     try {
       const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      state.ffmpeg.stdin.write(chunk);
+      const ok = state.ffmpeg.stdin.write(chunk);
+      if (!ok) {
+        // Backpressure: wait for drain before writing more chunks.
+        state.ffmpeg.stdin.once('drain', () => {});
+      }
     } catch (error: any) {
       log('Failed to write media chunk to ffmpeg stdin', {
         videoId: state.videoId,
