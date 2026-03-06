@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import http from 'http';
 import type { IncomingMessage } from 'http';
 import type { Socket } from 'net';
-import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { RawData } from 'ws';
@@ -57,6 +57,18 @@ const log = (message: string, meta?: Record<string, unknown>) => {
     return;
   }
   console.log(`[LIVE-INGEST][${ts}] ${message}`);
+};
+
+const ensureFfmpegAvailable = () => {
+  const check = spawnSync(FFMPEG_BIN, ['-version'], { encoding: 'utf8' });
+  if (check.error) {
+    throw new Error(`FFmpeg binary is not available: ${check.error.message}`);
+  }
+  if (check.status !== 0) {
+    throw new Error(`FFmpeg check failed with status ${check.status}: ${check.stderr || check.stdout}`);
+  }
+  const firstLine = (check.stdout || '').split('\n')[0] || 'ffmpeg detected';
+  log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
 };
 
 const validateIngestKey = async (videoId: string, key: string): Promise<ValidationResponse> => {
@@ -262,6 +274,7 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  ensureFfmpegAvailable();
   log('Live ingest service started', {
     port: PORT,
     apiBaseUrl: API_BASE_URL,
