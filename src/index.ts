@@ -1,9 +1,13 @@
 import 'dotenv/config';
 import express from 'express';
+import type { Request, Response } from 'express';
 import http from 'http';
+import type { IncomingMessage } from 'http';
+import type { Socket } from 'net';
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
+import type { RawData } from 'ws';
 
 interface ValidationResponse {
   success: boolean;
@@ -28,7 +32,7 @@ if (!LIVE_INGEST_SHARED_SECRET) {
 
 const app = express();
 
-app.get('/health', (_req, res) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
     service: 'video-manch-live-ingest',
@@ -103,12 +107,12 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNul
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  proc.stdout.on('data', (chunk) => {
+  proc.stdout.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
     if (text) log('ffmpeg stdout', { text });
   });
 
-  proc.stderr.on('data', (chunk) => {
+  proc.stderr.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
     if (text) log('ffmpeg stderr', { text });
   });
@@ -142,7 +146,7 @@ const closeClient = (ws: WebSocket, code: number, reason: string) => {
   }
 };
 
-server.on('upgrade', async (request, socket, head) => {
+server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buffer) => {
   try {
     const parsed = new URL(request.url || '', `http://${request.headers.host}`);
     const match = parsed.pathname.match(/^\/live\/ingest\/([a-zA-Z0-9-]+)$/);
@@ -176,7 +180,7 @@ server.on('upgrade', async (request, socket, head) => {
       return;
     }
 
-    wsServer.handleUpgrade(request, socket, head, (ws) => {
+    wsServer.handleUpgrade(request, socket, head, (ws: WebSocket) => {
       wsServer.emit('connection', ws, request, validation.data);
     });
   } catch (error: any) {
@@ -186,7 +190,7 @@ server.on('upgrade', async (request, socket, head) => {
   }
 });
 
-wsServer.on('connection', (ws, _request, validationData: ValidationResponse['data']) => {
+wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: ValidationResponse['data']) => {
   if (!validationData) {
     ws.close(1011, 'missing validation data');
     return;
@@ -197,12 +201,12 @@ wsServer.on('connection', (ws, _request, validationData: ValidationResponse['dat
 
   const ffmpeg = startFfmpeg(rtmpUrl, streamKey);
 
-  ffmpeg.on('close', (code, signal) => {
+  ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     log('ffmpeg process closed', { videoId, code, signal });
     closeClient(ws, 1011, 'ffmpeg stopped');
   });
 
-  ffmpeg.on('error', (error) => {
+  ffmpeg.on('error', (error: Error) => {
     log('ffmpeg process error', { videoId, message: error.message });
     closeClient(ws, 1011, 'ffmpeg error');
   });
@@ -217,7 +221,7 @@ wsServer.on('connection', (ws, _request, validationData: ValidationResponse['dat
 
   clients.set(ws, { videoId, streamKey, ffmpeg, pingTimer });
 
-  ws.on('message', (data, isBinary) => {
+  ws.on('message', (data: RawData, isBinary: boolean) => {
     const state = clients.get(ws);
     if (!state) return;
 
@@ -242,7 +246,7 @@ wsServer.on('connection', (ws, _request, validationData: ValidationResponse['dat
     }
   });
 
-  ws.on('close', (code, reason) => {
+  ws.on('close', (code: number, reason: Buffer) => {
     log('WebSocket disconnected', {
       videoId,
       code,
@@ -251,7 +255,7 @@ wsServer.on('connection', (ws, _request, validationData: ValidationResponse['dat
     closeClient(ws, 1000, 'client disconnected');
   });
 
-  ws.on('error', (error) => {
+  ws.on('error', (error: Error) => {
     log('WebSocket error', { videoId, message: error.message });
     closeClient(ws, 1011, 'websocket error');
   });
