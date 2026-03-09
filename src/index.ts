@@ -4,6 +4,7 @@ import type { Request, Response } from 'express';
 import http from 'http';
 import type { IncomingMessage } from 'http';
 import type { Socket } from 'net';
+import path from 'node:path';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
 import NodeMediaServer from 'node-media-server';
@@ -28,12 +29,13 @@ const LIVE_INGEST_SHARED_SECRET = process.env.LIVE_INGEST_SHARED_SECRET || '';
 const ENABLE_WS_INGEST = process.env.ENABLE_WS_INGEST !== 'false';
 const ENABLE_RTMP_SERVER = process.env.ENABLE_RTMP_SERVER === 'true';
 
-const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
+const FFMPEG_BIN = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
 const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 1024 * 1024);
 
 const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
 const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
+const MEDIA_ROOT_ABS = path.isAbsolute(MEDIA_ROOT) ? MEDIA_ROOT : path.resolve(process.cwd(), MEDIA_ROOT);
 const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 
 if (!LIVE_INGEST_SHARED_SECRET) {
@@ -41,6 +43,15 @@ if (!LIVE_INGEST_SHARED_SECRET) {
 }
 
 const app = express();
+
+// Serve generated HLS from the main HTTP port as well.
+// This avoids requiring a separate public mapping for NodeMedia HTTP port.
+app.use('/live', express.static(path.join(MEDIA_ROOT_ABS, 'live'), {
+  setHeaders: (res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store');
+  },
+}));
 
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
@@ -527,7 +538,7 @@ const startRtmpServer = () => {
   log('RTMP server started', {
     rtmpPort: RTMP_PORT,
     hlsHttpPort: HLS_HTTP_PORT,
-    mediaRoot: MEDIA_ROOT,
+    mediaRoot: MEDIA_ROOT_ABS,
   });
 };
 

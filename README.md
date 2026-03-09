@@ -21,6 +21,7 @@ If `ENABLE_RTMP_SERVER=true`, service also starts:
 
 - RTMP port `RTMP_PORT` (default `1935`)
 - local HLS HTTP `HLS_HTTP_PORT` (default `8000`)
+- HLS is also served by this service on `GET /live/*` via `PORT` (recommended public endpoint)
 
 ## Required Environment Variables
 
@@ -28,6 +29,7 @@ If `ENABLE_RTMP_SERVER=true`, service also starts:
 - `API_BASE_URL` (e.g. `https://api.videomanch.com`)
 - `LIVE_INGEST_SHARED_SECRET` (must match backend)
 - `FFMPEG_BIN` (optional, default `ffmpeg`)
+  - Recommended in containers: `FFMPEG_BIN=/usr/bin/ffmpeg`
 
 Optional RTMP mode variables:
 
