@@ -1,14 +1,20 @@
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { URL } from 'node:url';
+import NodeMediaServer from 'node-media-server';
 import { WebSocketServer } from 'ws';
 const PORT = Number(process.env.PORT || 3001);
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.videomanch.com';
 const LIVE_INGEST_SHARED_SECRET = process.env.LIVE_INGEST_SHARED_SECRET || '';
+const ENABLE_WS_INGEST = process.env.ENABLE_WS_INGEST !== 'false';
+const ENABLE_RTMP_SERVER = process.env.ENABLE_RTMP_SERVER === 'true';
 const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
 const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 1024 * 1024);
+const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
+const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
+const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
 if (!LIVE_INGEST_SHARED_SECRET) {
     throw new Error('LIVE_INGEST_SHARED_SECRET is required');
 }
@@ -18,6 +24,15 @@ app.get('/health', (_req, res) => {
         status: 'ok',
         service: 'video-manch-live-ingest',
         timestamp: new Date().toISOString(),
+        modes: {
+            wsIngest: ENABLE_WS_INGEST,
+            rtmpServer: ENABLE_RTMP_SERVER,
+        },
+        ports: {
+            http: PORT,
+            rtmp: ENABLE_RTMP_SERVER ? RTMP_PORT : null,
+            hlsHttp: ENABLE_RTMP_SERVER ? HLS_HTTP_PORT : null,
+        },
     });
 });
 const server = http.createServer(app);
@@ -30,6 +45,17 @@ const log = (message, meta) => {
         return;
     }
     console.log(`[LIVE-INGEST][${ts}] ${message}`);
+};
+const ensureFfmpegAvailable = () => {
+    const check = spawnSync(FFMPEG_BIN, ['-version'], { encoding: 'utf8' });
+    if (check.error) {
+        throw new Error(`FFmpeg binary is not available: ${check.error.message}`);
+    }
+    if (check.status !== 0) {
+        throw new Error(`FFmpeg check failed with status ${check.status}: ${check.stderr || check.stdout}`);
+    }
+    const firstLine = (check.stdout || '').split('\n')[0] || 'ffmpeg detected';
+    log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
 };
 const validateIngestKey = async (videoId, key) => {
     const url = `${API_BASE_URL}/live/ingest/validate/${encodeURIComponent(videoId)}?key=${encodeURIComponent(key)}`;
@@ -45,6 +71,19 @@ const validateIngestKey = async (videoId, key) => {
     }
     return response.json();
 };
+const validateRtmpStreamKey = async (streamKey) => {
+    const url = `${API_BASE_URL}/live/rtmp/validate/${encodeURIComponent(streamKey)}`;
+    const response = await fetch(url, {
+        headers: {
+            'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
+        },
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => 'unknown error');
+        return { success: false, error: `${response.status} ${text}` };
+    }
+    return response.json();
+};
 const startFfmpeg = (rtmpUrl, streamKey) => {
     const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
     const args = [
@@ -57,8 +96,19 @@ const startFfmpeg = (rtmpUrl, streamKey) => {
         'webm',
         '-i',
         'pipe:0',
+        // MediaRecorder (WebM/VP8|VP9) must be transcoded to H264 for RTMP/FLV output.
         '-c:v',
-        'copy',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-tune',
+        'zerolatency',
+        '-pix_fmt',
+        'yuv420p',
+        '-g',
+        '60',
+        '-keyint_min',
+        '60',
         '-c:a',
         'aac',
         '-ar',
@@ -109,6 +159,11 @@ const closeClient = (ws, code, reason) => {
     }
 };
 server.on('upgrade', async (request, socket, head) => {
+    if (!ENABLE_WS_INGEST) {
+        socket.write('HTTP/1.1 503 Service Unavailable\\r\\n\\r\\n');
+        socket.destroy();
+        return;
+    }
     try {
         const parsed = new URL(request.url || '', `http://${request.headers.host}`);
         const match = parsed.pathname.match(/^\/live\/ingest\/([a-zA-Z0-9-]+)$/);
@@ -163,6 +218,15 @@ wsServer.on('connection', (ws, _request, validationData) => {
         log('ffmpeg process error', { videoId, message: error.message });
         closeClient(ws, 1011, 'ffmpeg error');
     });
+    ffmpeg.stdin.on('error', (error) => {
+        log('ffmpeg stdin error', {
+            videoId,
+            message: error.message,
+            code: error.code,
+            syscall: error.syscall,
+        });
+        closeClient(ws, 1011, 'ffmpeg stdin error');
+    });
     const pingTimer = setInterval(() => {
         if (ws.readyState === ws.OPEN) {
             ws.ping();
@@ -175,11 +239,11 @@ wsServer.on('connection', (ws, _request, validationData) => {
         const state = clients.get(ws);
         if (!state)
             return;
-        if (!isBinary) {
-            // Ignore text frames from browser extensions/clients.
+        if (!isBinary)
             return;
-        }
-        if (!state.ffmpeg.stdin.writable) {
+        if (!state.ffmpeg.stdin.writable ||
+            state.ffmpeg.stdin.destroyed ||
+            state.ffmpeg.stdin.writableEnded) {
             return;
         }
         try {
@@ -207,9 +271,87 @@ wsServer.on('connection', (ws, _request, validationData) => {
         closeClient(ws, 1011, 'websocket error');
     });
 });
+const startRtmpServer = () => {
+    if (!ENABLE_RTMP_SERVER)
+        return;
+    const config = {
+        logType: 2,
+        rtmp: {
+            port: RTMP_PORT,
+            chunk_size: 60000,
+            gop_cache: true,
+            ping: 30,
+            ping_timeout: 60,
+        },
+        http: {
+            port: HLS_HTTP_PORT,
+            mediaroot: MEDIA_ROOT,
+            allow_origin: '*',
+        },
+        trans: {
+            ffmpeg: FFMPEG_BIN,
+            tasks: [
+                {
+                    app: 'live',
+                    hls: true,
+                    hlsFlags: '[hls_time=2:hls_list_size=6:hls_flags=delete_segments]',
+                    hlsKeep: false,
+                },
+            ],
+        },
+    };
+    const nms = new NodeMediaServer(config);
+    nms.on('prePublish', async (id, streamPath) => {
+        try {
+            const [, appName, streamKey] = streamPath.split('/');
+            if (appName !== 'live' || !streamKey) {
+                log('Rejecting RTMP publish - invalid stream path', { id, streamPath });
+                nms.getSession(id)?.reject();
+                return;
+            }
+            const validation = await validateRtmpStreamKey(streamKey);
+            if (!validation.success) {
+                log('Rejecting RTMP publish - stream validation failed', {
+                    id,
+                    streamPath,
+                    error: validation.error || 'unknown',
+                });
+                nms.getSession(id)?.reject();
+                return;
+            }
+            log('RTMP publish accepted', {
+                id,
+                streamPath,
+                videoId: validation.data?.videoId,
+                masterPlaylistUrl: validation.data?.masterPlaylistUrl,
+            });
+        }
+        catch (error) {
+            log('Rejecting RTMP publish - exception during validation', {
+                id,
+                streamPath,
+                message: error?.message,
+            });
+            nms.getSession(id)?.reject();
+        }
+    });
+    nms.on('donePublish', (id, streamPath) => {
+        log('RTMP publish stopped', { id, streamPath });
+    });
+    nms.run();
+    log('RTMP server started', {
+        rtmpPort: RTMP_PORT,
+        hlsHttpPort: HLS_HTTP_PORT,
+        mediaRoot: MEDIA_ROOT,
+    });
+};
 server.listen(PORT, '0.0.0.0', () => {
+    ensureFfmpegAvailable();
+    startRtmpServer();
     log('Live ingest service started', {
         port: PORT,
         apiBaseUrl: API_BASE_URL,
+        enableWsIngest: ENABLE_WS_INGEST,
+        enableRtmpServer: ENABLE_RTMP_SERVER,
     });
 });
