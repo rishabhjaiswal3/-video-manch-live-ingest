@@ -1,7 +1,7 @@
 ARG MEDIAMTX_VERSION=1.9.3
 
 # ── Static FFmpeg from official image (no download needed) ────────────────────
-FROM mwader/static-ffmpeg:7.1.0 AS ffmpeg-source
+FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg-source
 
 # ── MediaMTX from official image (no download needed) ────────────────────────
 FROM bluenviron/mediamtx:v1.9.3 AS mediamtx-source
