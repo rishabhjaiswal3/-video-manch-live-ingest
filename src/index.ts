@@ -5,6 +5,8 @@ import http from 'http';
 import type { IncomingMessage } from 'http';
 import type { Socket } from 'net';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
