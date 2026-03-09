@@ -1,0 +1,60 @@
+###############################################
+# VideoManch – MediaMTX configuration
+# Used by video-manch-live-ingest when ENABLE_RTMP_SERVER=true
+#
+# Environment variables substituted at startup:
+#   PORT          – Node.js HTTP port (for webhook callbacks)
+#   RTMP_PORT     – RTMP listen port  (default 1935)
+#   HLS_HTTP_PORT – HLS HTTP port     (default 8888)
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+logStructured: false
+
+# External auth: MediaMTX POSTs here before accepting any publisher.
+# Return 200 to allow, non-200 to reject.
+externalAuthenticationURL: http://127.0.0.1:$PORT/mediamtx/auth
+
+# ── Disable unused protocols ──────────────────────────────────────────────────
+rtsp:
+  enabled: false
+
+webrtc:
+  enabled: false
+
+srt:
+  enabled: false
+
+# ── RTMP ingest ───────────────────────────────────────────────────────────────
+rtmp:
+  enabled: true
+  address: :$RTMP_PORT
+
+# ── HLS output ────────────────────────────────────────────────────────────────
+hls:
+  enabled: true
+  address: :$HLS_HTTP_PORT
+  allowOrigin: "*"
+  # 7 segments × 2 s = 14 s window; 200 ms parts for low-latency HLS
+  segmentCount: 7
+  segmentDuration: 2s
+  partDuration: 200ms
+
+# ── Path rules ────────────────────────────────────────────────────────────────
+paths:
+  # Match any path under "live/" – stream key is the segment after the slash
+  "~^live/":
+    # Called when a publisher is accepted (after auth passes)
+    # $$MTX_PATH / $$MTX_ID → become $MTX_PATH / $MTX_ID at runtime (MediaMTX env vars)
+    runOnPublish: >
+      curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-publish"
+      -H "Content-Type: application/json"
+      -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"
+    runOnPublishRestart: false
+
+    # Called when the publisher disconnects
+    runOnUnpublish: >
+      curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-unpublish"
+      -H "Content-Type: application/json"
+      -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"

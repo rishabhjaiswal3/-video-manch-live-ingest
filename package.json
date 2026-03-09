@@ -14,8 +14,7 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "node-media-server": "^2.7.4",
-    "ws": "^8.18.0"
+"ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

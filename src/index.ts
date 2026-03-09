@@ -7,7 +7,6 @@ import type { Socket } from 'net';
 import path from 'node:path';
 import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { URL } from 'node:url';
-import NodeMediaServer from 'node-media-server';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { RawData } from 'ws';
 
@@ -22,36 +21,34 @@ interface WsValidationResponse {
   error?: string;
 }
 
+// ── Config ────────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT || 3001);
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.videomanch.com';
 const LIVE_INGEST_SHARED_SECRET = process.env.LIVE_INGEST_SHARED_SECRET || '';
 
 const ENABLE_WS_INGEST = process.env.ENABLE_WS_INGEST !== 'false';
+// When true, spawns MediaMTX as a child process for RTMP ingest + HLS output
 const ENABLE_RTMP_SERVER = process.env.ENABLE_RTMP_SERVER === 'true';
 
 const FFMPEG_BIN = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
 const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 1024 * 1024);
 
 const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
-const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
-const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
-const MEDIA_ROOT_ABS = path.isAbsolute(MEDIA_ROOT) ? MEDIA_ROOT : path.resolve(process.cwd(), MEDIA_ROOT);
+// HLS served directly by MediaMTX on this port
+const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8888);
 const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
+
+// MediaMTX binary + config path
+const MEDIAMTX_BIN = process.env.MEDIAMTX_BIN || 'mediamtx';
+const MEDIAMTX_CONFIG = process.env.MEDIAMTX_CONFIG || path.resolve('./mediamtx.yml');
 
 if (!LIVE_INGEST_SHARED_SECRET) {
   throw new Error('LIVE_INGEST_SHARED_SECRET is required');
 }
 
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
-
-// Serve generated HLS from the main HTTP port as well.
-// This avoids requiring a separate public mapping for NodeMedia HTTP port.
-app.use('/live', express.static(path.join(MEDIA_ROOT_ABS, 'live'), {
-  setHeaders: (res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'no-store');
-  },
-}));
+app.use(express.json());
 
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
@@ -65,21 +62,12 @@ app.get('/health', (_req: Request, res: Response) => {
     ports: {
       http: PORT,
       rtmp: ENABLE_RTMP_SERVER ? RTMP_PORT : null,
-      hlsHttp: ENABLE_RTMP_SERVER ? HLS_HTTP_PORT : null,
+      hls: ENABLE_RTMP_SERVER ? HLS_HTTP_PORT : null,
     },
   });
 });
 
-const server = http.createServer(app);
-const wsServer = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_SIZE_BYTES });
-
-const clients = new Map<WebSocket, {
-  videoId: string;
-  streamKey: string;
-  ffmpeg: ChildProcessWithoutNullStreams;
-  pingTimer: NodeJS.Timeout;
-}>();
-
+// ── Logging ───────────────────────────────────────────────────────────────────
 const log = (message: string, meta?: Record<string, unknown>) => {
   const ts = new Date().toISOString();
   if (meta) {
@@ -89,25 +77,12 @@ const log = (message: string, meta?: Record<string, unknown>) => {
   console.log(`[LIVE-INGEST][${ts}] ${message}`);
 };
 
-const ensureFfmpegAvailable = () => {
-  const check = spawnSync(FFMPEG_BIN, ['-version'], { encoding: 'utf8' });
-  if (check.error) {
-    throw new Error(`FFmpeg binary is not available: ${check.error.message}`);
-  }
-  if (check.status !== 0) {
-    throw new Error(`FFmpeg check failed with status ${check.status}: ${check.stderr || check.stdout}`);
-  }
-  const firstLine = (check.stdout || '').split('\n')[0] || 'ffmpeg detected';
-  log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
-};
-
+// ── Backend API helpers ───────────────────────────────────────────────────────
 const validateIngestKey = async (videoId: string, key: string): Promise<WsValidationResponse> => {
   const url = `${API_BASE_URL}/live/ingest/validate/${encodeURIComponent(videoId)}?key=${encodeURIComponent(key)}`;
   const response = await fetch(url, {
     method: 'GET',
-    headers: {
-      'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
-    },
+    headers: { 'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET },
   });
 
   if (!response.ok) {
@@ -121,9 +96,7 @@ const validateIngestKey = async (videoId: string, key: string): Promise<WsValida
 const validateRtmpStreamKey = async (streamKey: string) => {
   const url = `${API_BASE_URL}/live/rtmp/validate/${encodeURIComponent(streamKey)}`;
   const response = await fetch(url, {
-    headers: {
-      'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
-    },
+    headers: { 'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET },
   });
 
   if (!response.ok) {
@@ -156,47 +129,138 @@ const notifyIngestEvent = async (payload: {
   }
 };
 
+// ── MediaMTX webhook endpoints ────────────────────────────────────────────────
+// These are called by MediaMTX (not by clients directly).
+
+// POST /mediamtx/auth
+// MediaMTX calls this before accepting any publisher.
+// Body: { ip, user, password, path, protocol, id, action, query }
+app.post('/mediamtx/auth', async (req: Request, res: Response) => {
+  try {
+    const { ip, path: streamPath, action } = req.body || {};
+
+    // Allow all non-publish actions (e.g. HLS reads)
+    if (action !== 'publish') {
+      return res.status(200).end();
+    }
+
+    // Loopback connections are our own FFmpeg processes (WS ingest path) — always allow
+    if (ip === '127.0.0.1' || ip === '::1') {
+      log('MediaMTX auth: allowing loopback publisher', { ip, streamPath });
+      return res.status(200).end();
+    }
+
+    // Extract stream key: path format is "live/<streamKey>"
+    const streamKey = String(streamPath || '').split('/').pop() || '';
+    if (!streamKey) {
+      log('MediaMTX auth: rejected — missing stream key', { streamPath });
+      return res.status(403).json({ error: 'missing stream key' });
+    }
+
+    const validation = await validateRtmpStreamKey(streamKey);
+    if (!validation.success) {
+      log('MediaMTX auth: rejected — invalid stream key', { streamKey, error: validation.error });
+      return res.status(403).json({ error: 'invalid stream key' });
+    }
+
+    log('MediaMTX auth: allowed', { streamKey, videoId: validation.data?.videoId });
+    return res.status(200).end();
+  } catch (error: any) {
+    log('MediaMTX auth: error during validation', { message: error?.message });
+    return res.status(500).json({ error: 'auth check failed' });
+  }
+});
+
+// POST /mediamtx/on-publish
+// Called by MediaMTX runOnPublish hook when a stream starts.
+// Body: { path, id }
+app.post('/mediamtx/on-publish', async (req: Request, res: Response) => {
+  try {
+    const streamPath = String(req.body?.path || '');
+    const streamKey = streamPath.split('/').pop() || '';
+
+    log('MediaMTX on-publish', { streamPath, streamKey });
+
+    notifyIngestEvent({ event: 'ingest_started', streamKey, source: 'rtmp' }).catch((err: any) => {
+      log('Failed to notify ingest_started', { streamKey, message: err?.message });
+    });
+
+    return res.status(200).end();
+  } catch (error: any) {
+    log('MediaMTX on-publish: error', { message: error?.message });
+    return res.status(500).end();
+  }
+});
+
+// POST /mediamtx/on-unpublish
+// Called by MediaMTX runOnUnpublish hook when a stream ends.
+// Body: { path, id }
+app.post('/mediamtx/on-unpublish', async (req: Request, res: Response) => {
+  try {
+    const streamPath = String(req.body?.path || '');
+    const streamKey = streamPath.split('/').pop() || '';
+
+    log('MediaMTX on-unpublish', { streamPath, streamKey });
+
+    notifyIngestEvent({ event: 'ingest_stopped', streamKey, source: 'rtmp', reason: 'publish_ended' }).catch((err: any) => {
+      log('Failed to notify ingest_stopped', { streamKey, message: err?.message });
+    });
+
+    return res.status(200).end();
+  } catch (error: any) {
+    log('MediaMTX on-unpublish: error', { message: error?.message });
+    return res.status(500).end();
+  }
+});
+
+// ── WebSocket ingest (browser) ────────────────────────────────────────────────
+const server = http.createServer(app);
+const wsServer = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_SIZE_BYTES });
+
+const clients = new Map<WebSocket, {
+  videoId: string;
+  streamKey: string;
+  ffmpeg: ChildProcessWithoutNullStreams;
+  pingTimer: NodeJS.Timeout;
+}>();
+
+const ensureFfmpegAvailable = () => {
+  const check = spawnSync(FFMPEG_BIN, ['-version'], { encoding: 'utf8' });
+  if (check.error) {
+    throw new Error(`FFmpeg binary is not available: ${check.error.message}`);
+  }
+  if (check.status !== 0) {
+    throw new Error(`FFmpeg check failed with status ${check.status}: ${check.stderr || check.stdout}`);
+  }
+  const firstLine = (check.stdout || '').split('\n')[0] || 'ffmpeg detected';
+  log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
+};
+
 const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNullStreams => {
   const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
 
   const args = [
     '-hide_banner',
-    '-loglevel',
-    'warning',
-    '-fflags',
-    '+genpts',
-    '-f',
-    'webm',
-    '-i',
-    'pipe:0',
-    // MediaRecorder (WebM/VP8|VP9) must be transcoded to H264 for RTMP/FLV output.
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-tune',
-    'zerolatency',
-    '-pix_fmt',
-    'yuv420p',
-    '-g',
-    '60',
-    '-keyint_min',
-    '60',
-    '-c:a',
-    'aac',
-    '-ar',
-    '44100',
-    '-b:a',
-    '128k',
-    '-f',
-    'flv',
+    '-loglevel', 'warning',
+    '-fflags', '+genpts',
+    '-f', 'webm',
+    '-i', 'pipe:0',
+    // Transcode WebM/VP8|VP9 → H264/AAC for RTMP/FLV
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-tune', 'zerolatency',
+    '-pix_fmt', 'yuv420p',
+    '-g', '60',
+    '-keyint_min', '60',
+    '-c:a', 'aac',
+    '-ar', '44100',
+    '-b:a', '128k',
+    '-f', 'flv',
     target,
   ];
 
   log('Starting ffmpeg process', { target, ffmpegBin: FFMPEG_BIN });
-  const proc = spawn(FFMPEG_BIN, args, {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  const proc = spawn(FFMPEG_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   const stderrTail: string[] = [];
 
   proc.stdout.on('data', (chunk: Buffer) => {
@@ -213,20 +277,14 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNul
   });
 
   (proc as any).__stderrTail = stderrTail;
-
   return proc;
 };
 
+// Where FFmpeg should push: local MediaMTX RTMP when ENABLE_RTMP_SERVER,
+// otherwise fall back to the URL returned by the backend API.
 const resolveForwardRtmpUrl = (validatedRtmpUrl: string): string => {
-  if (RTMP_FORWARD_URL.trim()) {
-    return RTMP_FORWARD_URL.trim();
-  }
-
-  // If this service runs an RTMP server, default to local loopback forwarding.
-  if (ENABLE_RTMP_SERVER) {
-    return `rtmp://127.0.0.1:${RTMP_PORT}/live`;
-  }
-
+  if (RTMP_FORWARD_URL.trim()) return RTMP_FORWARD_URL.trim();
+  if (ENABLE_RTMP_SERVER) return `rtmp://127.0.0.1:${RTMP_PORT}/live`;
   return validatedRtmpUrl;
 };
 
@@ -236,15 +294,9 @@ const closeClient = (ws: WebSocket, code: number, reason: string) => {
     clearInterval(state.pingTimer);
 
     if (!state.ffmpeg.killed) {
-      try {
-        state.ffmpeg.stdin.end();
-      } catch {
-        // ignore
-      }
+      try { state.ffmpeg.stdin.end(); } catch { /* ignore */ }
       setTimeout(() => {
-        if (!state.ffmpeg.killed) {
-          state.ffmpeg.kill('SIGKILL');
-        }
+        if (!state.ffmpeg.killed) state.ffmpeg.kill('SIGKILL');
       }, 1500);
     }
   }
@@ -258,7 +310,7 @@ const closeClient = (ws: WebSocket, code: number, reason: string) => {
 
 server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buffer) => {
   if (!ENABLE_WS_INGEST) {
-    socket.write('HTTP/1.1 503 Service Unavailable\\r\\n\\r\\n');
+    socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -267,7 +319,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     const parsed = new URL(request.url || '', `http://${request.headers.host}`);
     const match = parsed.pathname.match(/^\/live\/ingest\/([a-zA-Z0-9-]+)$/);
     if (!match) {
-      socket.write('HTTP/1.1 404 Not Found\\r\\n\\r\\n');
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -276,7 +328,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     const key = parsed.searchParams.get('key') || '';
 
     if (!key) {
-      socket.write('HTTP/1.1 401 Unauthorized\\r\\n\\r\\n');
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -291,7 +343,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     const validation = await validateIngestKey(videoId, key);
     if (!validation.success || !validation.data || !validation.data.isLive) {
       log('Ingest validation failed', { videoId, error: validation.error || 'invalid key/state' });
-      socket.write('HTTP/1.1 403 Forbidden\\r\\n\\r\\n');
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -301,7 +353,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     });
   } catch (error: any) {
     log('Upgrade handling failed', { message: error?.message, stack: error?.stack });
-    socket.write('HTTP/1.1 500 Internal Server Error\\r\\n\\r\\n');
+    socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
     socket.destroy();
   }
 });
@@ -316,30 +368,15 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
   log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl });
 
-  notifyIngestEvent({
-    event: 'ingest_started',
-    videoId,
-    streamKey,
-    source: 'ws',
-  }).catch((error: any) => {
-    log('Failed to notify ingest start event', {
-      videoId,
-      streamKey,
-      source: 'ws',
-      message: error?.message || 'unknown error',
-    });
+  notifyIngestEvent({ event: 'ingest_started', videoId, streamKey, source: 'ws' }).catch((error: any) => {
+    log('Failed to notify ingest start event', { videoId, streamKey, source: 'ws', message: error?.message });
   });
 
   const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey);
 
   ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     const recentStderr = ((ffmpeg as any).__stderrTail as string[] | undefined) || [];
-    log('ffmpeg process closed', {
-      videoId,
-      code,
-      signal,
-      recentStderr: recentStderr.slice(-8),
-    });
+    log('ffmpeg process closed', { videoId, code, signal, recentStderr: recentStderr.slice(-8) });
     closeClient(ws, 1011, 'ffmpeg stopped');
   });
 
@@ -349,20 +386,12 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   });
 
   ffmpeg.stdin.on('error', (error: NodeJS.ErrnoException) => {
-    log('ffmpeg stdin error', {
-      videoId,
-      message: error.message,
-      code: error.code,
-      syscall: error.syscall,
-    });
+    log('ffmpeg stdin error', { videoId, message: error.message, code: error.code, syscall: error.syscall });
     closeClient(ws, 1011, 'ffmpeg stdin error');
   });
 
   const pingTimer = setInterval(() => {
-    if (ws.readyState === ws.OPEN) {
-      ws.ping();
-      return;
-    }
+    if (ws.readyState === ws.OPEN) { ws.ping(); return; }
     clearInterval(pingTimer);
   }, 15000);
 
@@ -370,49 +399,23 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 
   ws.on('message', (data: RawData, isBinary: boolean) => {
     const state = clients.get(ws);
-    if (!state) return;
+    if (!state || !isBinary) return;
 
-    if (!isBinary) return;
-
-    if (
-      !state.ffmpeg.stdin.writable ||
-      state.ffmpeg.stdin.destroyed ||
-      state.ffmpeg.stdin.writableEnded
-    ) {
-      return;
-    }
+    if (!state.ffmpeg.stdin.writable || state.ffmpeg.stdin.destroyed || state.ffmpeg.stdin.writableEnded) return;
 
     try {
       const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       state.ffmpeg.stdin.write(chunk);
     } catch (error: any) {
-      log('Failed to write media chunk to ffmpeg stdin', {
-        videoId: state.videoId,
-        message: error?.message,
-      });
+      log('Failed to write media chunk to ffmpeg stdin', { videoId: state.videoId, message: error?.message });
       closeClient(ws, 1011, 'ffmpeg stdin write failed');
     }
   });
 
   ws.on('close', (code: number, reason: Buffer) => {
-    log('WebSocket disconnected', {
-      videoId,
-      code,
-      reason: reason.toString(),
-    });
-    notifyIngestEvent({
-      event: 'ingest_stopped',
-      videoId,
-      streamKey,
-      source: 'ws',
-      reason: reason.toString() || `ws_close_${code}`,
-    }).catch((error: any) => {
-      log('Failed to notify ingest stop event', {
-        videoId,
-        streamKey,
-        source: 'ws',
-        message: error?.message || 'unknown error',
-      });
+    log('WebSocket disconnected', { videoId, code, reason: reason.toString() });
+    notifyIngestEvent({ event: 'ingest_stopped', videoId, streamKey, source: 'ws', reason: reason.toString() || `ws_close_${code}` }).catch((error: any) => {
+      log('Failed to notify ingest stop event', { videoId, streamKey, source: 'ws', message: error?.message });
     });
     closeClient(ws, 1000, 'client disconnected');
   });
@@ -423,128 +426,52 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   });
 });
 
-const startRtmpServer = () => {
+// ── MediaMTX process ──────────────────────────────────────────────────────────
+const startMediaMTX = () => {
   if (!ENABLE_RTMP_SERVER) return;
 
-  const config = {
-    logType: 2,
-    rtmp: {
-      port: RTMP_PORT,
-      chunk_size: 60000,
-      gop_cache: true,
-      ping: 30,
-      ping_timeout: 60,
+  const check = spawnSync(MEDIAMTX_BIN, ['--version'], { encoding: 'utf8' });
+  if (check.error) {
+    throw new Error(`MediaMTX binary not found at "${MEDIAMTX_BIN}": ${check.error.message}`);
+  }
+  const version = (check.stdout || check.stderr || '').split('\n')[0].trim();
+  log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: MEDIAMTX_CONFIG });
+
+  const proc = spawn(MEDIAMTX_BIN, [MEDIAMTX_CONFIG], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      RTMP_PORT: String(RTMP_PORT),
+      HLS_HTTP_PORT: String(HLS_HTTP_PORT),
     },
-    http: {
-      port: HLS_HTTP_PORT,
-      mediaroot: MEDIA_ROOT,
-      allow_origin: '*',
-    },
-    trans: {
-      ffmpeg: FFMPEG_BIN,
-      tasks: [
-        {
-          app: 'live',
-          hls: true,
-          hlsFlags: '[hls_time=2:hls_list_size=6:hls_flags=delete_segments]',
-          hlsKeep: false,
-        },
-      ],
-    },
-  };
-
-  const nms = new NodeMediaServer(config);
-  const activeRtmpSessions = new Map<string, { videoId?: string; streamKey: string }>();
-
-  nms.on('prePublish', async (id: string, streamPath: string) => {
-    try {
-      const [, appName, streamKey] = streamPath.split('/');
-      if (appName !== 'live' || !streamKey) {
-        log('Rejecting RTMP publish - invalid stream path', { id, streamPath });
-        nms.getSession(id)?.reject();
-        return;
-      }
-
-      const validation = await validateRtmpStreamKey(streamKey);
-      if (!validation.success) {
-        log('Rejecting RTMP publish - stream validation failed', {
-          id,
-          streamPath,
-          error: validation.error || 'unknown',
-        });
-        nms.getSession(id)?.reject();
-        return;
-      }
-
-      log('RTMP publish accepted', {
-        id,
-        streamPath,
-        videoId: validation.data?.videoId,
-        masterPlaylistUrl: validation.data?.masterPlaylistUrl,
-      });
-      activeRtmpSessions.set(id, {
-        videoId: validation.data?.videoId,
-        streamKey,
-      });
-    } catch (error: any) {
-      log('Rejecting RTMP publish - exception during validation', {
-        id,
-        streamPath,
-        message: error?.message,
-      });
-      nms.getSession(id)?.reject();
-    }
   });
 
-  nms.on('postPublish', (id: string, streamPath: string) => {
-    const session = activeRtmpSessions.get(id);
-    const [, , streamKey] = streamPath.split('/');
-    notifyIngestEvent({
-      event: 'ingest_started',
-      videoId: session?.videoId,
-      streamKey: session?.streamKey || streamKey,
-      source: 'rtmp',
-    }).catch((error: any) => {
-      log('Failed to notify RTMP ingest start event', {
-        id,
-        streamPath,
-        message: error?.message || 'unknown error',
-      });
-    });
+  proc.stdout.on('data', (chunk: Buffer) => {
+    const text = chunk.toString().trim();
+    if (text) log('[MEDIAMTX] ' + text);
   });
 
-  nms.on('donePublish', (id: string, streamPath: string) => {
-    log('RTMP publish stopped', { id, streamPath });
-    const session = activeRtmpSessions.get(id);
-    const [, , streamKey] = streamPath.split('/');
-    notifyIngestEvent({
-      event: 'ingest_stopped',
-      videoId: session?.videoId,
-      streamKey: session?.streamKey || streamKey,
-      source: 'rtmp',
-      reason: 'publish_ended',
-    }).catch((error: any) => {
-      log('Failed to notify RTMP ingest stop event', {
-        id,
-        streamPath,
-        message: error?.message || 'unknown error',
-      });
-    }).finally(() => {
-      activeRtmpSessions.delete(id);
-    });
+  proc.stderr.on('data', (chunk: Buffer) => {
+    const text = chunk.toString().trim();
+    if (text) log('[MEDIAMTX] ' + text);
   });
 
-  nms.run();
-  log('RTMP server started', {
-    rtmpPort: RTMP_PORT,
-    hlsHttpPort: HLS_HTTP_PORT,
-    mediaRoot: MEDIA_ROOT_ABS,
+  proc.on('close', (code: number | null) => {
+    log('MediaMTX process exited', { code });
   });
+
+  proc.on('error', (err: Error) => {
+    log('MediaMTX process error', { message: err.message });
+  });
+
+  log('MediaMTX started', { rtmpPort: RTMP_PORT, hlsHttpPort: HLS_HTTP_PORT });
 };
 
+// ── Boot ──────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   ensureFfmpegAvailable();
-  startRtmpServer();
+  startMediaMTX();
   log('Live ingest service started', {
     port: PORT,
     apiBaseUrl: API_BASE_URL,
