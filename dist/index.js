@@ -15,6 +15,7 @@ const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 
 const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
 const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
+const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 if (!LIVE_INGEST_SHARED_SECRET) {
     throw new Error('LIVE_INGEST_SHARED_SECRET is required');
 }
@@ -84,6 +85,20 @@ const validateRtmpStreamKey = async (streamKey) => {
     }
     return response.json();
 };
+const notifyIngestEvent = async (payload) => {
+    const response = await fetch(`${API_BASE_URL}/live/ingest/events`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
+        },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => 'unknown error');
+        throw new Error(`ingest event failed: ${response.status} ${text}`);
+    }
+};
 const startFfmpeg = (rtmpUrl, streamKey) => {
     const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
     const args = [
@@ -123,6 +138,7 @@ const startFfmpeg = (rtmpUrl, streamKey) => {
     const proc = spawn(FFMPEG_BIN, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
     });
+    const stderrTail = [];
     proc.stdout.on('data', (chunk) => {
         const text = chunk.toString().trim();
         if (text)
@@ -130,10 +146,25 @@ const startFfmpeg = (rtmpUrl, streamKey) => {
     });
     proc.stderr.on('data', (chunk) => {
         const text = chunk.toString().trim();
-        if (text)
-            log('ffmpeg stderr', { text });
+        if (!text)
+            return;
+        stderrTail.push(text);
+        if (stderrTail.length > 30)
+            stderrTail.shift();
+        log('ffmpeg stderr', { text });
     });
+    proc.__stderrTail = stderrTail;
     return proc;
+};
+const resolveForwardRtmpUrl = (validatedRtmpUrl) => {
+    if (RTMP_FORWARD_URL.trim()) {
+        return RTMP_FORWARD_URL.trim();
+    }
+    // If this service runs an RTMP server, default to local loopback forwarding.
+    if (ENABLE_RTMP_SERVER) {
+        return `rtmp://127.0.0.1:${RTMP_PORT}/live`;
+    }
+    return validatedRtmpUrl;
 };
 const closeClient = (ws, code, reason) => {
     const state = clients.get(ws);
@@ -208,10 +239,30 @@ wsServer.on('connection', (ws, _request, validationData) => {
         return;
     }
     const { videoId, streamKey, rtmpUrl } = validationData;
-    log('WebSocket connected', { videoId, rtmpUrl });
-    const ffmpeg = startFfmpeg(rtmpUrl, streamKey);
+    const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
+    log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl });
+    notifyIngestEvent({
+        event: 'ingest_started',
+        videoId,
+        streamKey,
+        source: 'ws',
+    }).catch((error) => {
+        log('Failed to notify ingest start event', {
+            videoId,
+            streamKey,
+            source: 'ws',
+            message: error?.message || 'unknown error',
+        });
+    });
+    const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey);
     ffmpeg.on('close', (code, signal) => {
-        log('ffmpeg process closed', { videoId, code, signal });
+        const recentStderr = ffmpeg.__stderrTail || [];
+        log('ffmpeg process closed', {
+            videoId,
+            code,
+            signal,
+            recentStderr: recentStderr.slice(-8),
+        });
         closeClient(ws, 1011, 'ffmpeg stopped');
     });
     ffmpeg.on('error', (error) => {
@@ -264,6 +315,20 @@ wsServer.on('connection', (ws, _request, validationData) => {
             code,
             reason: reason.toString(),
         });
+        notifyIngestEvent({
+            event: 'ingest_stopped',
+            videoId,
+            streamKey,
+            source: 'ws',
+            reason: reason.toString() || `ws_close_${code}`,
+        }).catch((error) => {
+            log('Failed to notify ingest stop event', {
+                videoId,
+                streamKey,
+                source: 'ws',
+                message: error?.message || 'unknown error',
+            });
+        });
         closeClient(ws, 1000, 'client disconnected');
     });
     ws.on('error', (error) => {
@@ -301,6 +366,7 @@ const startRtmpServer = () => {
         },
     };
     const nms = new NodeMediaServer(config);
+    const activeRtmpSessions = new Map();
     nms.on('prePublish', async (id, streamPath) => {
         try {
             const [, appName, streamKey] = streamPath.split('/');
@@ -325,6 +391,10 @@ const startRtmpServer = () => {
                 videoId: validation.data?.videoId,
                 masterPlaylistUrl: validation.data?.masterPlaylistUrl,
             });
+            activeRtmpSessions.set(id, {
+                videoId: validation.data?.videoId,
+                streamKey,
+            });
         }
         catch (error) {
             log('Rejecting RTMP publish - exception during validation', {
@@ -335,8 +405,41 @@ const startRtmpServer = () => {
             nms.getSession(id)?.reject();
         }
     });
+    nms.on('postPublish', (id, streamPath) => {
+        const session = activeRtmpSessions.get(id);
+        const [, , streamKey] = streamPath.split('/');
+        notifyIngestEvent({
+            event: 'ingest_started',
+            videoId: session?.videoId,
+            streamKey: session?.streamKey || streamKey,
+            source: 'rtmp',
+        }).catch((error) => {
+            log('Failed to notify RTMP ingest start event', {
+                id,
+                streamPath,
+                message: error?.message || 'unknown error',
+            });
+        });
+    });
     nms.on('donePublish', (id, streamPath) => {
         log('RTMP publish stopped', { id, streamPath });
+        const session = activeRtmpSessions.get(id);
+        const [, , streamKey] = streamPath.split('/');
+        notifyIngestEvent({
+            event: 'ingest_stopped',
+            videoId: session?.videoId,
+            streamKey: session?.streamKey || streamKey,
+            source: 'rtmp',
+            reason: 'publish_ended',
+        }).catch((error) => {
+            log('Failed to notify RTMP ingest stop event', {
+                id,
+                streamPath,
+                message: error?.message || 'unknown error',
+            });
+        }).finally(() => {
+            activeRtmpSessions.delete(id);
+        });
     });
     nms.run();
     log('RTMP server started', {

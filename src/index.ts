@@ -123,6 +123,28 @@ const validateRtmpStreamKey = async (streamKey: string) => {
   return response.json() as Promise<{ success: boolean; data?: any; error?: string }>;
 };
 
+const notifyIngestEvent = async (payload: {
+  event: 'ingest_started' | 'ingest_stopped';
+  videoId?: string;
+  streamKey?: string;
+  source: 'ws' | 'rtmp';
+  reason?: string;
+}) => {
+  const response = await fetch(`${API_BASE_URL}/live/ingest/events`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => 'unknown error');
+    throw new Error(`ingest event failed: ${response.status} ${text}`);
+  }
+};
+
 const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNullStreams => {
   const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
 
@@ -283,6 +305,20 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
   log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl });
 
+  notifyIngestEvent({
+    event: 'ingest_started',
+    videoId,
+    streamKey,
+    source: 'ws',
+  }).catch((error: any) => {
+    log('Failed to notify ingest start event', {
+      videoId,
+      streamKey,
+      source: 'ws',
+      message: error?.message || 'unknown error',
+    });
+  });
+
   const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey);
 
   ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
@@ -353,6 +389,20 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
       code,
       reason: reason.toString(),
     });
+    notifyIngestEvent({
+      event: 'ingest_stopped',
+      videoId,
+      streamKey,
+      source: 'ws',
+      reason: reason.toString() || `ws_close_${code}`,
+    }).catch((error: any) => {
+      log('Failed to notify ingest stop event', {
+        videoId,
+        streamKey,
+        source: 'ws',
+        message: error?.message || 'unknown error',
+      });
+    });
     closeClient(ws, 1000, 'client disconnected');
   });
 
@@ -393,6 +443,7 @@ const startRtmpServer = () => {
   };
 
   const nms = new NodeMediaServer(config);
+  const activeRtmpSessions = new Map<string, { videoId?: string; streamKey: string }>();
 
   nms.on('prePublish', async (id: string, streamPath: string) => {
     try {
@@ -420,6 +471,10 @@ const startRtmpServer = () => {
         videoId: validation.data?.videoId,
         masterPlaylistUrl: validation.data?.masterPlaylistUrl,
       });
+      activeRtmpSessions.set(id, {
+        videoId: validation.data?.videoId,
+        streamKey,
+      });
     } catch (error: any) {
       log('Rejecting RTMP publish - exception during validation', {
         id,
@@ -430,8 +485,42 @@ const startRtmpServer = () => {
     }
   });
 
+  nms.on('postPublish', (id: string, streamPath: string) => {
+    const session = activeRtmpSessions.get(id);
+    const [, , streamKey] = streamPath.split('/');
+    notifyIngestEvent({
+      event: 'ingest_started',
+      videoId: session?.videoId,
+      streamKey: session?.streamKey || streamKey,
+      source: 'rtmp',
+    }).catch((error: any) => {
+      log('Failed to notify RTMP ingest start event', {
+        id,
+        streamPath,
+        message: error?.message || 'unknown error',
+      });
+    });
+  });
+
   nms.on('donePublish', (id: string, streamPath: string) => {
     log('RTMP publish stopped', { id, streamPath });
+    const session = activeRtmpSessions.get(id);
+    const [, , streamKey] = streamPath.split('/');
+    notifyIngestEvent({
+      event: 'ingest_stopped',
+      videoId: session?.videoId,
+      streamKey: session?.streamKey || streamKey,
+      source: 'rtmp',
+      reason: 'publish_ended',
+    }).catch((error: any) => {
+      log('Failed to notify RTMP ingest stop event', {
+        id,
+        streamPath,
+        message: error?.message || 'unknown error',
+      });
+    }).finally(() => {
+      activeRtmpSessions.delete(id);
+    });
   });
 
   nms.run();

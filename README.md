@@ -39,6 +39,7 @@ Optional RTMP mode variables:
 
 - `GET /live/ingest/validate/:videoId?key=...`
 - `GET /live/rtmp/validate/:streamKey`
+- `POST /live/ingest/events`
 
 Both must validate `x-live-ingest-secret`.
 
