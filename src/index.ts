@@ -40,9 +40,8 @@ const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8888);
 const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 
-// MediaMTX binary + config path
+// MediaMTX binary path
 const MEDIAMTX_BIN = process.env.MEDIAMTX_BIN || 'mediamtx';
-const MEDIAMTX_CONFIG = process.env.MEDIAMTX_CONFIG || path.resolve('./mediamtx.yml');
 
 if (!LIVE_INGEST_SHARED_SECRET) {
   throw new Error('LIVE_INGEST_SHARED_SECRET is required');
@@ -429,8 +428,8 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 });
 
 // ── MediaMTX process ──────────────────────────────────────────────────────────
-const spawnMediaMTX = (restartDelay = 3000, attempt = 1) => {
-  const proc = spawn(MEDIAMTX_BIN, [MEDIAMTX_CONFIG], {
+const spawnMediaMTX = (configPath: string, restartDelay = 3000, attempt = 1) => {
+  const proc = spawn(MEDIAMTX_BIN, [configPath], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
@@ -456,7 +455,7 @@ const spawnMediaMTX = (restartDelay = 3000, attempt = 1) => {
     if (code !== 0) {
       const delay = Math.min(restartDelay * attempt, 30000);
       log(`MediaMTX restarting in ${delay}ms`, { attempt: attempt + 1 });
-      setTimeout(() => spawnMediaMTX(restartDelay, attempt + 1), delay);
+      setTimeout(() => spawnMediaMTX(configPath, restartDelay, attempt + 1), delay);
     }
   });
 
@@ -464,6 +463,46 @@ const spawnMediaMTX = (restartDelay = 3000, attempt = 1) => {
     log('MediaMTX process error', { message: err.message });
   });
 };
+
+const buildMediaMTXConfig = (): string => `
+logLevel: info
+logDestinations: [stdout]
+
+authMethod: http
+authHTTPAddress: http://127.0.0.1:${PORT}/mediamtx/auth
+authHTTPExclude:
+  - action: read
+  - action: playback
+  - action: api
+  - action: metrics
+  - action: pprof
+
+rtsp: no
+webrtc: no
+srt: no
+
+rtmp: yes
+rtmpAddress: :${RTMP_PORT}
+
+hls: yes
+hlsAddress: :${HLS_HTTP_PORT}
+hlsAllowOrigin: "*"
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+hlsPartDuration: 200ms
+
+paths:
+  "~^live/":
+    runOnReady: >
+      curl -sf -X POST "http://127.0.0.1:${PORT}/mediamtx/on-publish"
+      -H "Content-Type: application/json"
+      -d "{\\"path\\":\\"$MTX_PATH\\",\\"id\\":\\"$MTX_ID\\"}"
+    runOnReadyRestart: no
+    runOnNotReady: >
+      curl -sf -X POST "http://127.0.0.1:${PORT}/mediamtx/on-unpublish"
+      -H "Content-Type: application/json"
+      -d "{\\"path\\":\\"$MTX_PATH\\",\\"id\\":\\"$MTX_ID\\"}"
+`.trimStart();
 
 const startMediaMTX = () => {
   if (!ENABLE_RTMP_SERVER) return;
@@ -473,9 +512,14 @@ const startMediaMTX = () => {
     throw new Error(`MediaMTX binary not found at "${MEDIAMTX_BIN}": ${check.error.message}`);
   }
   const version = (check.stdout || check.stderr || '').split('\n')[0].trim();
-  log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: MEDIAMTX_CONFIG });
 
-  spawnMediaMTX();
+  // Write resolved config (with actual port values) to a temp file.
+  // MediaMTX v1.9.x does not substitute $VAR in YAML values at runtime.
+  const resolvedConfig = path.join(os.tmpdir(), 'mediamtx-resolved.yml');
+  fs.writeFileSync(resolvedConfig, buildMediaMTXConfig(), 'utf8');
+
+  log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: resolvedConfig });
+  spawnMediaMTX(resolvedConfig);
   log('MediaMTX started', { rtmpPort: RTMP_PORT, hlsHttpPort: HLS_HTTP_PORT });
 };
 
