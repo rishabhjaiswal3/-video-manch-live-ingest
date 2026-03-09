@@ -10,7 +10,6 @@
 
 logLevel: info
 logDestinations: [stdout]
-logStructured: false
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 # External HTTP auth: MediaMTX POSTs here before accepting any publisher.
