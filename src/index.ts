@@ -34,6 +34,7 @@ const MAX_MESSAGE_SIZE_BYTES = Number(process.env.MAX_MESSAGE_SIZE_BYTES || 4 * 
 const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8000);
 const MEDIA_ROOT = process.env.MEDIA_ROOT || './media';
+const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 
 if (!LIVE_INGEST_SHARED_SECRET) {
   throw new Error('LIVE_INGEST_SHARED_SECRET is required');
@@ -163,6 +164,7 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNul
   const proc = spawn(FFMPEG_BIN, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  const stderrTail: string[] = [];
 
   proc.stdout.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
@@ -171,10 +173,28 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNul
 
   proc.stderr.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
-    if (text) log('ffmpeg stderr', { text });
+    if (!text) return;
+    stderrTail.push(text);
+    if (stderrTail.length > 30) stderrTail.shift();
+    log('ffmpeg stderr', { text });
   });
 
+  (proc as any).__stderrTail = stderrTail;
+
   return proc;
+};
+
+const resolveForwardRtmpUrl = (validatedRtmpUrl: string): string => {
+  if (RTMP_FORWARD_URL.trim()) {
+    return RTMP_FORWARD_URL.trim();
+  }
+
+  // If this service runs an RTMP server, default to local loopback forwarding.
+  if (ENABLE_RTMP_SERVER) {
+    return `rtmp://127.0.0.1:${RTMP_PORT}/live`;
+  }
+
+  return validatedRtmpUrl;
 };
 
 const closeClient = (ws: WebSocket, code: number, reason: string) => {
@@ -260,12 +280,19 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
   }
 
   const { videoId, streamKey, rtmpUrl } = validationData;
-  log('WebSocket connected', { videoId, rtmpUrl });
+  const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
+  log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl });
 
-  const ffmpeg = startFfmpeg(rtmpUrl, streamKey);
+  const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey);
 
   ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
-    log('ffmpeg process closed', { videoId, code, signal });
+    const recentStderr = ((ffmpeg as any).__stderrTail as string[] | undefined) || [];
+    log('ffmpeg process closed', {
+      videoId,
+      code,
+      signal,
+      recentStderr: recentStderr.slice(-8),
+    });
     closeClient(ws, 1011, 'ffmpeg stopped');
   });
 
