@@ -1,5 +1,5 @@
 ###############################################
-# VideoManch – MediaMTX configuration
+# VideoManch – MediaMTX v1.9.x configuration
 # Used by video-manch-live-ingest when ENABLE_RTMP_SERVER=true
 #
 # Environment variables substituted at startup:
@@ -12,49 +12,50 @@ logLevel: info
 logDestinations: [stdout]
 logStructured: false
 
-# External auth: MediaMTX POSTs here before accepting any publisher.
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# External HTTP auth: MediaMTX POSTs here before accepting any publisher.
 # Return 200 to allow, non-200 to reject.
-externalAuthenticationURL: http://127.0.0.1:$PORT/mediamtx/auth
+authMethod: http
+authHTTPAddress: http://127.0.0.1:$PORT/mediamtx/auth
+authHTTPExclude:
+  - action: read
+  - action: playback
+  - action: api
+  - action: metrics
+  - action: pprof
 
 # ── Disable unused protocols ──────────────────────────────────────────────────
-rtsp:
-  enabled: false
-
-webrtc:
-  enabled: false
-
-srt:
-  enabled: false
+rtsp: no
+webrtc: no
+srt: no
 
 # ── RTMP ingest ───────────────────────────────────────────────────────────────
-rtmp:
-  enabled: true
-  address: :$RTMP_PORT
+rtmp: yes
+rtmpAddress: :$RTMP_PORT
 
 # ── HLS output ────────────────────────────────────────────────────────────────
-hls:
-  enabled: true
-  address: :$HLS_HTTP_PORT
-  allowOrigin: "*"
-  # 7 segments × 2 s = 14 s window; 200 ms parts for low-latency HLS
-  segmentCount: 7
-  segmentDuration: 2s
-  partDuration: 200ms
+hls: yes
+hlsAddress: :$HLS_HTTP_PORT
+hlsAllowOrigin: "*"
+# 7 segments × 2 s = 14 s window; 200 ms parts for low-latency HLS
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+hlsPartDuration: 200ms
 
 # ── Path rules ────────────────────────────────────────────────────────────────
 paths:
   # Match any path under "live/" – stream key is the segment after the slash
   "~^live/":
     # Called when a publisher is accepted and stream is ready
-    # $$MTX_PATH / $$MTX_ID → become $MTX_PATH / $MTX_ID at runtime (MediaMTX env vars)
+    # $MTX_PATH / $MTX_ID are set by MediaMTX at runtime
     runOnReady: >
       curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-publish"
       -H "Content-Type: application/json"
-      -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"
-    runOnReadyRestart: false
+      -d "{\"path\":\"$MTX_PATH\",\"id\":\"$MTX_ID\"}"
+    runOnReadyRestart: no
 
     # Called when the publisher disconnects / stream is no longer available
     runOnNotReady: >
       curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-unpublish"
       -H "Content-Type: application/json"
-      -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"
+      -d "{\"path\":\"$MTX_PATH\",\"id\":\"$MTX_ID\"}"
