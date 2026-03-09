@@ -51,6 +51,42 @@ if (!LIVE_INGEST_SHARED_SECRET) {
 const app = express();
 app.use(express.json());
 
+// ── HLS proxy ─────────────────────────────────────────────────────────────────
+// Railway only exposes one port (PORT). MediaMTX HLS runs on HLS_HTTP_PORT
+// internally. This proxy forwards /live/* requests from the public domain to
+// the internal MediaMTX HLS server so viewers can fetch playlists + segments.
+app.use('/live', (req: Request, res: Response) => {
+  if (!ENABLE_RTMP_SERVER) {
+    res.status(503).end();
+    return;
+  }
+
+  const targetPath = `/live${req.path === '/' ? '' : req.path}${req.search || ''}`;
+  const proxyReq = http.request(
+    {
+      host: '127.0.0.1',
+      port: HLS_HTTP_PORT,
+      path: targetPath,
+      method: req.method,
+      headers: { ...req.headers, host: `127.0.0.1:${HLS_HTTP_PORT}` },
+    },
+    (proxyRes: IncomingMessage) => {
+      // Forward CORS headers so browsers can read HLS content cross-origin
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      proxyRes.pipe(res);
+    },
+  );
+
+  proxyReq.on('error', (err: Error) => {
+    log('HLS proxy error', { path: targetPath, message: err.message });
+    if (!res.headersSent) res.status(502).end();
+  });
+
+  proxyReq.end();
+});
+
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
