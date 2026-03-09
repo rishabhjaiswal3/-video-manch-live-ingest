@@ -61,7 +61,8 @@ app.use('/live', (req: Request, res: Response) => {
     return;
   }
 
-  const targetPath = `/live${req.path === '/' ? '' : req.path}${req.search || ''}`;
+  // req.url is relative to the /live mount point and preserves the query string
+  const targetPath = `/live${req.url}`;
   const proxyReq = http.request(
     {
       host: '127.0.0.1',
