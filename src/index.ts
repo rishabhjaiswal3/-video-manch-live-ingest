@@ -427,16 +427,7 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 });
 
 // ── MediaMTX process ──────────────────────────────────────────────────────────
-const startMediaMTX = () => {
-  if (!ENABLE_RTMP_SERVER) return;
-
-  const check = spawnSync(MEDIAMTX_BIN, ['--version'], { encoding: 'utf8' });
-  if (check.error) {
-    throw new Error(`MediaMTX binary not found at "${MEDIAMTX_BIN}": ${check.error.message}`);
-  }
-  const version = (check.stdout || check.stderr || '').split('\n')[0].trim();
-  log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: MEDIAMTX_CONFIG });
-
+const spawnMediaMTX = (restartDelay = 3000, attempt = 1) => {
   const proc = spawn(MEDIAMTX_BIN, [MEDIAMTX_CONFIG], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
@@ -454,17 +445,35 @@ const startMediaMTX = () => {
 
   proc.stderr.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
-    if (text) log('[MEDIAMTX] ' + text);
+    if (text) log('[MEDIAMTX] ERR: ' + text);
   });
 
   proc.on('close', (code: number | null) => {
-    log('MediaMTX process exited', { code });
+    log('MediaMTX process exited', { code, attempt });
+    // Restart unless the exit was clean (code 0 = intentional shutdown)
+    if (code !== 0) {
+      const delay = Math.min(restartDelay * attempt, 30000);
+      log(`MediaMTX restarting in ${delay}ms`, { attempt: attempt + 1 });
+      setTimeout(() => spawnMediaMTX(restartDelay, attempt + 1), delay);
+    }
   });
 
   proc.on('error', (err: Error) => {
     log('MediaMTX process error', { message: err.message });
   });
+};
 
+const startMediaMTX = () => {
+  if (!ENABLE_RTMP_SERVER) return;
+
+  const check = spawnSync(MEDIAMTX_BIN, ['--version'], { encoding: 'utf8' });
+  if (check.error) {
+    throw new Error(`MediaMTX binary not found at "${MEDIAMTX_BIN}": ${check.error.message}`);
+  }
+  const version = (check.stdout || check.stderr || '').split('\n')[0].trim();
+  log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: MEDIAMTX_CONFIG });
+
+  spawnMediaMTX();
   log('MediaMTX started', { rtmpPort: RTMP_PORT, hlsHttpPort: HLS_HTTP_PORT });
 };
 
