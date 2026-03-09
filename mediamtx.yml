@@ -45,16 +45,16 @@ hls:
 paths:
   # Match any path under "live/" – stream key is the segment after the slash
   "~^live/":
-    # Called when a publisher is accepted (after auth passes)
+    # Called when a publisher is accepted and stream is ready
     # $$MTX_PATH / $$MTX_ID → become $MTX_PATH / $MTX_ID at runtime (MediaMTX env vars)
-    runOnPublish: >
+    runOnReady: >
       curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-publish"
       -H "Content-Type: application/json"
       -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"
-    runOnPublishRestart: false
+    runOnReadyRestart: false
 
-    # Called when the publisher disconnects
-    runOnUnpublish: >
+    # Called when the publisher disconnects / stream is no longer available
+    runOnNotReady: >
       curl -sf -X POST "http://127.0.0.1:$PORT/mediamtx/on-unpublish"
       -H "Content-Type: application/json"
       -d "{\"path\":\"$$MTX_PATH\",\"id\":\"$$MTX_ID\"}"
