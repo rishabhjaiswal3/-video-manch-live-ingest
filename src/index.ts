@@ -397,14 +397,19 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp
       ]
     : [
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',   // ~2× faster than veryfast, fine for live
+        '-preset', 'ultrafast',
         '-tune', 'zerolatency',
         '-pix_fmt', 'yuv420p',
-        '-threads', '2',          // cap per-process threads; prevents N processes fighting for all CPUs
-        // Force keyframes every 500ms to match hlsPartDuration=500ms.
-        '-force_key_frames', 'expr:gte(t,n_forced*0.5)',
-        '-g', '15',
-        '-keyint_min', '10',
+        '-threads', '2',
+        '-r', '30',               // force constant 30fps output — needed for stable keyframes from WebM pipe
+        '-vsync', 'cfr',          // constant frame rate — eliminates timestamp drift from browser encoder
+        '-g', '60',               // keyframe every 60 frames = 2s at 30fps (matches hlsSegmentDuration=2s)
+        '-keyint_min', '60',      // minimum keyframe interval — prevents scene-cut keyframes
+        '-x264-params', 'scenecut=0',  // disable scene-cut detection — keyframes at exact intervals only
+        // Target 1500 kbps video → 2s segment ≈ 375 KB (200–450 KB range)
+        '-b:v', '1500k',
+        '-maxrate', '2000k',
+        '-bufsize', '4000k',
       ];
 
   const args = [
@@ -708,8 +713,8 @@ hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
 hlsSegmentCount: 7
-hlsSegmentDuration: 1s
-hlsPartDuration: 500ms
+hlsSegmentDuration: 2s
+hlsPartDuration: 1s
 
 paths:
   "~^live/":

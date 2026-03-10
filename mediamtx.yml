@@ -36,11 +36,13 @@ rtmpAddress: :$RTMP_PORT
 hls: yes
 hlsAddress: :$HLS_HTTP_PORT
 hlsAllowOrigin: "*"
-# 7 segments × 1 s = 7 s window; LL-HLS (MediaMTX v1.9.3 requires minimum 7 for LL-HLS)
-# hlsPartDuration 500ms = 2 parts per segment → ~1.5–2.5s end-to-end latency with LL-HLS player
+# 7 segments × 2s = 14s DVR window.
+# LL-HLS: 1s parts per 2s segment → 4 parts per segment → ~3-4s latency.
+# 1s parts tolerate browser keyframe jitter (MediaRecorder doesn't guarantee exact timing).
+# 500ms parts caused constant "part duration changed" warnings on every stream.
 hlsSegmentCount: 7
-hlsSegmentDuration: 1s
-hlsPartDuration: 500ms
+hlsSegmentDuration: 2s
+hlsPartDuration: 1s
 
 # ── Path rules ────────────────────────────────────────────────────────────────
 paths:
