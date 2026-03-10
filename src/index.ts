@@ -43,8 +43,25 @@ const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 // MediaMTX binary path
 const MEDIAMTX_BIN = process.env.MEDIAMTX_BIN || 'mediamtx';
 
+// ── Cloudflare Stream mode ────────────────────────────────────────────────────
+// Set CF_STREAM_MODE=true to push RTMP to Cloudflare Stream instead of local
+// MediaMTX. Cloudflare Stream handles transcoding + HLS delivery at CDN scale,
+// supporting 1000+ simultaneous live streams without any FFmpeg farm.
+//
+// Required env vars when CF_STREAM_MODE=true:
+//   CF_ACCOUNT_ID        — Cloudflare account ID
+//   CF_STREAM_API_TOKEN  — API token with Stream:Edit permission
+//
+// Migration: just flip CF_STREAM_MODE=true in Railway env. Zero player changes.
+const CF_STREAM_MODE = process.env.CF_STREAM_MODE === 'true';
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
+const CF_STREAM_API_TOKEN = process.env.CF_STREAM_API_TOKEN || '';
+
 if (!LIVE_INGEST_SHARED_SECRET) {
   throw new Error('LIVE_INGEST_SHARED_SECRET is required');
+}
+if (CF_STREAM_MODE && (!CF_ACCOUNT_ID || !CF_STREAM_API_TOKEN)) {
+  throw new Error('CF_ACCOUNT_ID and CF_STREAM_API_TOKEN are required when CF_STREAM_MODE=true');
 }
 
 // ── Express ───────────────────────────────────────────────────────────────────
@@ -53,15 +70,23 @@ app.use(express.json());
 
 // ── HLS proxy ─────────────────────────────────────────────────────────────────
 // Railway only exposes one port (PORT). MediaMTX HLS runs on HLS_HTTP_PORT
-// internally. This proxy forwards /live/* requests from the public domain to
-// the internal MediaMTX HLS server so viewers can fetch playlists + segments.
+// internally. In production, the Cloudflare Worker (live-hls-worker) handles
+// all viewer requests on live.videomanch.com and calls ingest.videomanch.com
+// (this server) as the origin. This proxy serves those Worker→origin requests.
 app.use('/live', (req: Request, res: Response) => {
   if (!ENABLE_RTMP_SERVER) {
     res.status(503).end();
     return;
   }
 
-  // req.url is relative to the /live mount point and preserves the query string
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.status(204).end();
+    return;
+  }
+
   const targetPath = `/live${req.url}`;
   const proxyReq = http.request(
     {
@@ -72,7 +97,6 @@ app.use('/live', (req: Request, res: Response) => {
       headers: { ...req.headers, host: `127.0.0.1:${HLS_HTTP_PORT}` },
     },
     (proxyRes: IncomingMessage) => {
-      // Forward CORS headers so browsers can read HLS content cross-origin
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
       res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
@@ -188,6 +212,71 @@ const notifyIngestEvent = async (payload: {
   }
 };
 
+// ── Cloudflare Stream API ─────────────────────────────────────────────────────
+// Only used when CF_STREAM_MODE=true. Each live stream gets its own CF Live Input.
+// CF handles transcoding (multi-bitrate), HLS packaging, and global CDN delivery.
+// This replaces local FFmpeg → MediaMTX for viewer-facing delivery.
+// FFmpeg still runs locally to re-mux the browser's WebM/MP4 WebSocket data
+// into RTMP and push it to Cloudflare Stream's ingest endpoint.
+
+interface CfLiveInput {
+  uid: string;           // Cloudflare live input ID
+  rtmpsUrl: string;      // RTMPS ingest URL (push target for FFmpeg)
+  rtmpsKey: string;      // Stream key for the RTMPS URL
+  playbackUrl: string;   // HLS playback URL served by Cloudflare CDN
+}
+
+const cfApiBase = () => `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/stream/live_inputs`;
+
+const cfHeaders = () => ({
+  'Authorization': `Bearer ${CF_STREAM_API_TOKEN}`,
+  'Content-Type':  'application/json',
+});
+
+const createCfLiveInput = async (videoId: string): Promise<CfLiveInput> => {
+  const response = await fetch(cfApiBase(), {
+    method:  'POST',
+    headers: cfHeaders(),
+    body: JSON.stringify({
+      meta:              { name: `videomanch-${videoId}` },
+      recording:         { mode: 'automatic' },  // auto-record for VOD replay
+      deleteRecordingAfterDays: 7,               // keep 7 days then auto-delete
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => 'unknown');
+    throw new Error(`CF Stream create live input failed: ${response.status} ${text}`);
+  }
+
+  const data: any = await response.json();
+  const result = data?.result;
+  if (!result?.uid || !result?.rtmps?.url || !result?.rtmps?.streamKey) {
+    throw new Error(`CF Stream response missing fields: ${JSON.stringify(data)}`);
+  }
+
+  // Cloudflare Stream HLS URL: https://customer-<hash>.cloudflarestream.com/<uid>/manifest/video.m3u8
+  const playbackUrl = `https://customer-${result.uid}.cloudflarestream.com/${result.uid}/manifest/video.m3u8`;
+
+  return {
+    uid:         result.uid,
+    rtmpsUrl:    result.rtmps.url,
+    rtmpsKey:    result.rtmps.streamKey,
+    playbackUrl: result.playback?.hls ?? playbackUrl,
+  };
+};
+
+const deleteCfLiveInput = async (uid: string): Promise<void> => {
+  const response = await fetch(`${cfApiBase()}/${uid}`, {
+    method:  'DELETE',
+    headers: cfHeaders(),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => 'unknown');
+    log('CF Stream delete live input failed (non-fatal)', { uid, status: response.status, text });
+  }
+};
+
 // ── MediaMTX webhook endpoints ────────────────────────────────────────────────
 // These are called by MediaMTX (not by clients directly).
 
@@ -298,26 +387,37 @@ const ensureFfmpegAvailable = () => {
 const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp4' = 'webm'): ChildProcessWithoutNullStreams => {
   const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
 
+  // MP4 from Safari/iOS is already H.264 — copy video stream (zero encode CPU).
+  // WebM from Chrome/Firefox is VP8/VP9 — must transcode to H.264 for RTMP/FLV.
+  const isH264Input = container === 'mp4';
+
+  const videoArgs: string[] = isH264Input
+    ? [
+        '-c:v', 'copy',  // passthrough — no CPU cost for video
+      ]
+    : [
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',   // ~2× faster than veryfast, fine for live
+        '-tune', 'zerolatency',
+        '-pix_fmt', 'yuv420p',
+        '-threads', '2',          // cap per-process threads; prevents N processes fighting for all CPUs
+        // Force keyframes every 500ms to match hlsPartDuration=500ms.
+        '-force_key_frames', 'expr:gte(t,n_forced*0.5)',
+        '-g', '15',
+        '-keyint_min', '10',
+      ];
+
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-fflags', '+genpts',
-    '-f', container === 'mp4' ? 'mp4' : 'webm',
+    '-f', isH264Input ? 'mp4' : 'webm',
     '-i', 'pipe:0',
-    // Transcode to H264/AAC for RTMP/FLV
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-tune', 'zerolatency',
-    '-pix_fmt', 'yuv420p',
-    // Force a keyframe exactly every 1 second (time-based, not frame-count-based).
-    // This is critical for LL-HLS: MediaMTX places HLS part boundaries at IDR keyframes.
-    // hlsPartDuration=1s must match this interval for stable part durations.
-    '-force_key_frames', 'expr:gte(t,n_forced*1.0)',
-    '-g', '30',
-    '-keyint_min', '25',
+    ...videoArgs,
     '-c:a', 'aac',
     '-ar', '44100',
     '-b:a', '128k',
+    '-threads', '2',
     '-f', 'flv',
     target,
   ];
@@ -422,7 +522,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
   }
 });
 
-wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: WsValidationResponse['data'], container: 'webm' | 'mp4' = 'webm') => {
+wsServer.on('connection', async (ws: WebSocket, _request: IncomingMessage, validationData: WsValidationResponse['data'], container: 'webm' | 'mp4' = 'webm') => {
   if (!validationData) {
     ws.close(1011, 'missing validation data');
     return;
@@ -438,18 +538,52 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
     return;
   }
 
-  const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
-  log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl, container });
+  // ── Cloudflare Stream mode ────────────────────────────────────────────────
+  // Create a CF Live Input per stream. FFmpeg pushes to CF Stream's RTMPS
+  // endpoint instead of local MediaMTX. CF handles transcoding + HLS delivery
+  // at scale — supports 1000+ simultaneous streams without an FFmpeg farm.
+  let cfLiveInputUid: string | null = null;
+  let forwardRtmpUrl: string;
+  let ffmpegStreamKey: string;
 
-  notifyIngestEvent({ event: 'ingest_started', videoId, streamKey, source: 'ws' }).catch((error: any) => {
-    log('Failed to notify ingest start event', { videoId, streamKey, source: 'ws', message: error?.message });
-  });
+  if (CF_STREAM_MODE) {
+    try {
+      const liveInput = await createCfLiveInput(videoId);
+      cfLiveInputUid = liveInput.uid;
+      forwardRtmpUrl = liveInput.rtmpsUrl;
+      ffmpegStreamKey = liveInput.rtmpsKey;
+      log('CF Stream live input created', { videoId, uid: liveInput.uid, playbackUrl: liveInput.playbackUrl });
 
-  const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey, container);
+      // Tell the backend the CF Stream playback URL so viewers get the CF HLS URL
+      notifyIngestEvent({
+        event: 'ingest_started', videoId, streamKey, source: 'ws',
+        reason: `cf_playback_url:${liveInput.playbackUrl}`,
+      }).catch((error: any) => {
+        log('Failed to notify ingest start (CF mode)', { videoId, message: error?.message });
+      });
+    } catch (error: any) {
+      log('Failed to create CF Stream live input — closing connection', { videoId, message: error?.message });
+      ws.close(1011, 'cf_stream_init_failed');
+      return;
+    }
+  } else {
+    forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
+    ffmpegStreamKey = streamKey;
+    notifyIngestEvent({ event: 'ingest_started', videoId, streamKey, source: 'ws' }).catch((error: any) => {
+      log('Failed to notify ingest start event', { videoId, streamKey, source: 'ws', message: error?.message });
+    });
+  }
+
+  log('WebSocket connected', { videoId, forwardRtmpUrl, container, cfMode: CF_STREAM_MODE });
+
+  const ffmpeg = startFfmpeg(forwardRtmpUrl, ffmpegStreamKey, container);
 
   ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     const recentStderr = ((ffmpeg as any).__stderrTail as string[] | undefined) || [];
     log('ffmpeg process closed', { videoId, code, signal, recentStderr: recentStderr.slice(-8) });
+    if (CF_STREAM_MODE && cfLiveInputUid) {
+      deleteCfLiveInput(cfLiveInputUid).catch(() => {});
+    }
     closeClient(ws, 1011, 'ffmpeg stopped');
   });
 
@@ -498,6 +632,9 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
 
   ws.on('close', (code: number, reason: Buffer) => {
     log('WebSocket disconnected', { videoId, code, reason: reason.toString() });
+    if (CF_STREAM_MODE && cfLiveInputUid) {
+      deleteCfLiveInput(cfLiveInputUid).catch(() => {});
+    }
     notifyIngestEvent({ event: 'ingest_stopped', videoId, streamKey, source: 'ws', reason: reason.toString() || `ws_close_${code}` }).catch((error: any) => {
       log('Failed to notify ingest stop event', { videoId, streamKey, source: 'ws', message: error?.message });
     });
@@ -571,8 +708,8 @@ hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
 hlsSegmentCount: 7
-hlsSegmentDuration: 2s
-hlsPartDuration: 1s
+hlsSegmentDuration: 1s
+hlsPartDuration: 500ms
 
 paths:
   "~^live/":

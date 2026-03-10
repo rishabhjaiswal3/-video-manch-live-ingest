@@ -36,10 +36,11 @@ rtmpAddress: :$RTMP_PORT
 hls: yes
 hlsAddress: :$HLS_HTTP_PORT
 hlsAllowOrigin: "*"
-# 10 segments × 2 s = 20 s window; LL-HLS (MediaMTX v1.9.3 requires minimum 7 for LL-HLS)
+# 7 segments × 1 s = 7 s window; LL-HLS (MediaMTX v1.9.3 requires minimum 7 for LL-HLS)
+# hlsPartDuration 500ms = 2 parts per segment → ~1.5–2.5s end-to-end latency with LL-HLS player
 hlsSegmentCount: 7
-hlsSegmentDuration: 2s
-hlsPartDuration: 1s
+hlsSegmentDuration: 1s
+hlsPartDuration: 500ms
 
 # ── Path rules ────────────────────────────────────────────────────────────────
 paths:
