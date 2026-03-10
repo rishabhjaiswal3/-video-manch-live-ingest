@@ -545,8 +545,9 @@ rtmpAddress: :${RTMP_PORT}
 hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
-hlsSegmentCount: 6
+hlsSegmentCount: 10
 hlsSegmentDuration: 2s
+hlsPartDuration: 200ms
 
 paths:
   "~^live/":
