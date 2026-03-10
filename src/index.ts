@@ -461,12 +461,9 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    // Reduce probe/analysis buffer so FFmpeg starts encoding immediately rather
-    // than buffering several seconds of WebM input before starting (kills startup latency)
-    '-probesize', '32768',
-    '-analyzeduration', '0',
-    '-fflags', '+genpts+nobuffer',
+    '-fflags', '+genpts+nobuffer+discardcorrupt',
     '-flags', 'low_delay',
+    '-err_detect', 'ignore_err',
     '-f', isH264Input ? 'mp4' : 'webm',
     '-i', 'pipe:0',
     ...videoArgs,
