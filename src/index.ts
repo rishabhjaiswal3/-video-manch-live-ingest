@@ -295,22 +295,26 @@ const ensureFfmpegAvailable = () => {
   log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
 };
 
-const startFfmpeg = (rtmpUrl: string, streamKey: string): ChildProcessWithoutNullStreams => {
+const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp4' = 'webm'): ChildProcessWithoutNullStreams => {
   const target = `${rtmpUrl.replace(/\/$/, '')}/${streamKey}`;
 
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-fflags', '+genpts',
-    '-f', 'webm',
+    '-f', container === 'mp4' ? 'mp4' : 'webm',
     '-i', 'pipe:0',
-    // Transcode WebM/VP8|VP9 → H264/AAC for RTMP/FLV
+    // Transcode to H264/AAC for RTMP/FLV
     '-c:v', 'libx264',
     '-preset', 'veryfast',
     '-tune', 'zerolatency',
     '-pix_fmt', 'yuv420p',
-    '-g', '60',
-    '-keyint_min', '60',
+    // Force a keyframe exactly every 1 second (time-based, not frame-count-based).
+    // This is critical for LL-HLS: MediaMTX places HLS part boundaries at IDR keyframes.
+    // hlsPartDuration=1s must match this interval for stable part durations.
+    '-force_key_frames', 'expr:gte(t,n_forced*1.0)',
+    '-g', '30',
+    '-keyint_min', '25',
     '-c:a', 'aac',
     '-ar', '44100',
     '-b:a', '128k',
@@ -385,6 +389,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
 
     const videoId = match[1];
     const key = parsed.searchParams.get('key') || '';
+    const container = parsed.searchParams.get('container') === 'mp4' ? 'mp4' : 'webm';
 
     if (!key) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -408,7 +413,7 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     }
 
     wsServer.handleUpgrade(request, socket, head, (ws: WebSocket) => {
-      wsServer.emit('connection', ws, request, validation.data);
+      wsServer.emit('connection', ws, request, validation.data, container);
     });
   } catch (error: any) {
     log('Upgrade handling failed', { message: error?.message, stack: error?.stack });
@@ -417,21 +422,30 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
   }
 });
 
-wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: WsValidationResponse['data']) => {
+wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationData: WsValidationResponse['data'], container: 'webm' | 'mp4' = 'webm') => {
   if (!validationData) {
     ws.close(1011, 'missing validation data');
     return;
   }
 
   const { videoId, streamKey, rtmpUrl } = validationData;
+
+  // Reject duplicate streams for the same videoId
+  const existingClient = Array.from(clients.values()).find(c => c.videoId === videoId);
+  if (existingClient) {
+    log('Duplicate stream attempt rejected', { videoId });
+    ws.close(4009, 'stream_already_active');
+    return;
+  }
+
   const forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
-  log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl });
+  log('WebSocket connected', { videoId, validatedRtmpUrl: rtmpUrl, forwardRtmpUrl, container });
 
   notifyIngestEvent({ event: 'ingest_started', videoId, streamKey, source: 'ws' }).catch((error: any) => {
     log('Failed to notify ingest start event', { videoId, streamKey, source: 'ws', message: error?.message });
   });
 
-  const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey);
+  const ffmpeg = startFfmpeg(forwardRtmpUrl, streamKey, container);
 
   ffmpeg.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     const recentStderr = ((ffmpeg as any).__stderrTail as string[] | undefined) || [];
@@ -449,9 +463,20 @@ wsServer.on('connection', (ws: WebSocket, _request: IncomingMessage, validationD
     closeClient(ws, 1011, 'ffmpeg stdin error');
   });
 
+  let lastPong = Date.now();
+  ws.on('pong', () => { lastPong = Date.now(); });
+
   const pingTimer = setInterval(() => {
-    if (ws.readyState === ws.OPEN) { ws.ping(); return; }
-    clearInterval(pingTimer);
+    if (ws.readyState !== ws.OPEN) {
+      clearInterval(pingTimer);
+      return;
+    }
+    if (Date.now() - lastPong > 45000) {
+      log('WebSocket pong timeout — closing dead connection', { videoId });
+      closeClient(ws, 1001, 'pong_timeout');
+      return;
+    }
+    ws.ping();
   }, 15000);
 
   clients.set(ws, { videoId, streamKey, ffmpeg, pingTimer });
@@ -545,9 +570,9 @@ rtmpAddress: :${RTMP_PORT}
 hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
-hlsSegmentCount: 10
+hlsSegmentCount: 7
 hlsSegmentDuration: 2s
-hlsPartDuration: 200ms
+hlsPartDuration: 1s
 
 paths:
   "~^live/":
