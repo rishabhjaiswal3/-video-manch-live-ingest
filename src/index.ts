@@ -712,7 +712,7 @@ rtmpAddress: :${RTMP_PORT}
 hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
-hlsSegmentCount: 7
+hlsSegmentCount: 15
 hlsSegmentDuration: 2s
 hlsPartDuration: 1s
 
