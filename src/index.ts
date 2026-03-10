@@ -79,6 +79,19 @@ app.use('/live', (req: Request, res: Response) => {
     return;
   }
 
+  // Serve the pre-generated gap.mp4 for #EXT-X-GAP placeholder requests from VHS
+  if (req.url.endsWith('/gap.mp4') || req.url === '/gap.mp4') {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (gapMp4Buffer) {
+      res.status(200).send(gapMp4Buffer);
+    } else {
+      res.status(204).end();
+    }
+    return;
+  }
+
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -382,6 +395,39 @@ const ensureFfmpegAvailable = () => {
   }
   const firstLine = (check.stdout || '').split('\n')[0] || 'ffmpeg detected';
   log('FFmpeg detected', { ffmpegBin: FFMPEG_BIN, version: firstLine });
+};
+
+// ── gap.mp4 ───────────────────────────────────────────────────────────────────
+// Video.js VHS requests gap.mp4 when the playlist contains an #EXT-X-GAP tag
+// (stream discontinuity). MediaMTX does not serve this file, causing 404 →
+// playback stall. We generate a minimal silent fMP4 at startup with FFmpeg
+// and serve it for any /live/*/gap.mp4 request.
+let gapMp4Buffer: Buffer | null = null;
+
+const generateGapMp4 = (): void => {
+  const tmpPath = path.join(os.tmpdir(), 'gap.mp4');
+  const result = spawnSync(FFMPEG_BIN, [
+    '-y',
+    '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+    '-f', 'lavfi', '-i', 'color=black:size=2x2:rate=30',
+    '-t', '0.034',                    // ~1 video frame @ 30fps
+    '-c:a', 'aac', '-b:a', '32k',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+    '-pix_fmt', 'yuv420p',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    tmpPath,
+  ], { encoding: 'buffer' });
+
+  if (result.status !== 0) {
+    log('gap.mp4 generation failed (non-fatal)', { stderr: result.stderr?.toString().slice(0, 200) });
+    return;
+  }
+  try {
+    gapMp4Buffer = fs.readFileSync(tmpPath);
+    log('gap.mp4 generated', { bytes: gapMp4Buffer.length });
+  } catch (err: any) {
+    log('gap.mp4 read failed (non-fatal)', { message: err?.message });
+  }
 };
 
 const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp4' = 'webm'): ChildProcessWithoutNullStreams => {
@@ -751,6 +797,7 @@ const startMediaMTX = () => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   ensureFfmpegAvailable();
+  generateGapMp4();
   startMediaMTX();
   log('Live ingest service started', {
     port: PORT,
