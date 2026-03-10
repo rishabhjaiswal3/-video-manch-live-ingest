@@ -80,15 +80,31 @@ app.use('/live', (req: Request, res: Response) => {
     },
   );
 
-  proxyReq.on('error', (err: Error) => {
-    log('HLS proxy error', { path: targetPath, message: err.message });
+  proxyReq.on('error', (err: Error & { code?: string; syscall?: string }) => {
+    log('HLS proxy error', { path: targetPath, message: err.message, code: err.code, syscall: err.syscall });
     if (!res.headersSent) res.status(502).end();
   });
 
   proxyReq.end();
 });
 
-app.get('/health', (_req: Request, res: Response) => {
+app.get('/health', async (_req: Request, res: Response) => {
+  let hlsReachable: boolean | null = null;
+  let hlsStatus: string = 'not_checked';
+
+  if (ENABLE_RTMP_SERVER) {
+    hlsReachable = await new Promise<boolean>((resolve) => {
+      const probe = http.request(
+        { host: '127.0.0.1', port: HLS_HTTP_PORT, path: '/', method: 'GET', timeout: 2000 },
+        () => resolve(true),
+      );
+      probe.on('error', () => resolve(false));
+      probe.on('timeout', () => { probe.destroy(); resolve(false); });
+      probe.end();
+    });
+    hlsStatus = hlsReachable ? 'reachable' : 'unreachable';
+  }
+
   res.status(200).json({
     status: 'ok',
     service: 'video-manch-live-ingest',
@@ -102,6 +118,11 @@ app.get('/health', (_req: Request, res: Response) => {
       rtmp: ENABLE_RTMP_SERVER ? RTMP_PORT : null,
       hls: ENABLE_RTMP_SERVER ? HLS_HTTP_PORT : null,
     },
+    hls: {
+      port: HLS_HTTP_PORT,
+      status: hlsStatus,
+    },
+    activeStreams: clients.size,
   });
 });
 
@@ -524,9 +545,8 @@ rtmpAddress: :${RTMP_PORT}
 hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
-hlsSegmentCount: 7
+hlsSegmentCount: 6
 hlsSegmentDuration: 2s
-hlsPartDuration: 200ms
 
 paths:
   "~^live/":

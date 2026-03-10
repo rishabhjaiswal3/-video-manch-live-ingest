@@ -36,10 +36,9 @@ rtmpAddress: :$RTMP_PORT
 hls: yes
 hlsAddress: :$HLS_HTTP_PORT
 hlsAllowOrigin: "*"
-# 7 segments × 2 s = 14 s window; 200 ms parts for low-latency HLS
-hlsSegmentCount: 7
+# 6 segments × 2 s = 12 s window; regular HLS (no LL-HLS)
+hlsSegmentCount: 6
 hlsSegmentDuration: 2s
-hlsPartDuration: 200ms
 
 # ── Path rules ────────────────────────────────────────────────────────────────
 paths:
