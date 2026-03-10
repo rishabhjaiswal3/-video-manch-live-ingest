@@ -461,7 +461,12 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    '-fflags', '+genpts',
+    // Reduce probe/analysis buffer so FFmpeg starts encoding immediately rather
+    // than buffering several seconds of WebM input before starting (kills startup latency)
+    '-probesize', '32768',
+    '-analyzeduration', '0',
+    '-fflags', '+genpts+nobuffer',
+    '-flags', 'low_delay',
     '-f', isH264Input ? 'mp4' : 'webm',
     '-i', 'pipe:0',
     ...videoArgs,
@@ -666,6 +671,14 @@ wsServer.on('connection', async (ws: WebSocket, _request: IncomingMessage, valid
 
   clients.set(ws, { videoId, streamKey, ffmpeg, pingTimer });
 
+  // ── Chunk timing diagnostics ──────────────────────────────────────────────
+  // Logs every 30 chunks (~every 3s at 100ms MediaRecorder timeslice).
+  // Watches for: large gaps between chunks (stalled MediaRecorder), tiny chunks
+  // (MediaRecorder timeslice too small), backpressure on ffmpeg stdin.
+  let chunkCount = 0;
+  let lastChunkTime = Date.now();
+  let totalBytes = 0;
+
   ws.on('message', (data: RawData, isBinary: boolean) => {
     const state = clients.get(ws);
     if (!state || !isBinary) return;
@@ -674,6 +687,32 @@ wsServer.on('connection', async (ws: WebSocket, _request: IncomingMessage, valid
 
     try {
       const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+      const now = Date.now();
+      const gapMs = now - lastChunkTime;
+      chunkCount++;
+      totalBytes += chunk.length;
+      lastChunkTime = now;
+
+      // Log every 30 chunks: chunk interval, size, backpressure
+      if (chunkCount % 30 === 0) {
+        const backpressure = !state.ffmpeg.stdin.write('');  // dry-write to check buffer
+        log('[DIAG] chunk stats', {
+          videoId,
+          chunkCount,
+          lastGapMs: gapMs,
+          chunkBytes: chunk.length,
+          avgBytesPerChunk: Math.round(totalBytes / chunkCount),
+          stdinBackpressure: backpressure,
+        });
+      }
+
+      // Warn on large gaps (>500ms between chunks → MediaRecorder stalled)
+      if (chunkCount > 1 && gapMs > 500) {
+        log('[DIAG] large chunk gap — MediaRecorder may have stalled', {
+          videoId, gapMs, chunkCount,
+        });
+      }
+
       state.ffmpeg.stdin.write(chunk);
     } catch (error: any) {
       log('Failed to write media chunk to ffmpeg stdin', { videoId: state.videoId, message: error?.message });
