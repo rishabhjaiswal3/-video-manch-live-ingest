@@ -40,6 +40,33 @@ const RTMP_PORT = Number(process.env.RTMP_PORT || 1935);
 const HLS_HTTP_PORT = Number(process.env.HLS_HTTP_PORT || 8888);
 const RTMP_FORWARD_URL = process.env.RTMP_FORWARD_URL || '';
 
+// ── Low-latency HLS (MediaMTX) ────────────────────────────────────────────────
+// Defaults align WebSocket→RTMP encoder GOP with segment length so each segment
+// starts on a keyframe. Tune with HLS_SEGMENT_SEC / HLS_PART_DURATION / etc.
+const HLS_VARIANT_RAW = (process.env.HLS_VARIANT || 'lowLatency').trim();
+const HLS_VARIANT = HLS_VARIANT_RAW || 'lowLatency';
+const HLS_IS_LOW_LATENCY = HLS_VARIANT.toLowerCase() === 'lowlatency';
+const HLS_SEGMENT_DURATION = (process.env.HLS_SEGMENT_DURATION || '1s').trim();
+const HLS_PART_DURATION = (process.env.HLS_PART_DURATION || '200ms').trim();
+const HLS_SEGMENT_COUNT = (process.env.HLS_SEGMENT_COUNT || '8').trim();
+/** Parsed segment length in seconds (for x264 -g / keyint_min when transcoding WebM) */
+const HLS_SEGMENT_SEC = Math.min(4, Math.max(0.5, Number.parseFloat(process.env.HLS_SEGMENT_SEC || '') || 1));
+const HLS_FPS = Math.min(60, Math.max(15, Number.parseInt(process.env.HLS_ENCODE_FPS || '30', 10) || 30));
+/** Keyframe every segment at HLS_FPS — required for clean LL-HLS segment boundaries */
+const HLS_GOP_FRAMES = Math.max(15, Math.round(HLS_FPS * HLS_SEGMENT_SEC));
+const HLS_ALWAYS_REMUX = process.env.HLS_ALWAYS_REMUX !== 'false';
+
+/** Outbound calls to watch-backend / Cloudflare — avoids hung sockets when API is slow */
+const API_FETCH_TIMEOUT_MS = Math.min(120_000, Math.max(3_000, Number.parseInt(process.env.API_FETCH_TIMEOUT_MS || '15000', 10) || 15_000));
+/** 0 = unlimited (default). Set e.g. 32–64 per instance for predictable RAM/CPU. */
+const MAX_CONCURRENT_WS_STREAMS = Math.max(0, Number.parseInt(process.env.MAX_CONCURRENT_WS_STREAMS || '0', 10) || 0);
+/** LL-HLS playlists can block on origin; keep below load balancer max */
+const HLS_PROXY_ORIGIN_TIMEOUT_MS = Math.min(600_000, Math.max(30_000, Number.parseInt(process.env.HLS_PROXY_ORIGIN_TIMEOUT_MS || '180000', 10) || 180_000));
+/** MediaMTX: must exceed LL-HLS part blocking interval (default 10s breaks blocking m3u8) */
+const MEDIAMTX_READ_TIMEOUT = (process.env.MEDIAMTX_READ_TIMEOUT || '60s').trim();
+const MEDIAMTX_WRITE_TIMEOUT = (process.env.MEDIAMTX_WRITE_TIMEOUT || '60s').trim();
+const INGEST_EVENT_MAX_ATTEMPTS = Math.min(6, Math.max(1, Number.parseInt(process.env.INGEST_EVENT_MAX_ATTEMPTS || '3', 10) || 3));
+
 // MediaMTX binary path
 const MEDIAMTX_BIN = process.env.MEDIAMTX_BIN || 'mediamtx';
 
@@ -101,13 +128,17 @@ app.use('/live', (req: Request, res: Response) => {
   }
 
   const targetPath = `/live${req.url}`;
+  const headers = sanitizeProxyHeaders(req.headers);
+  headers.host = `127.0.0.1:${HLS_HTTP_PORT}`;
+
   const proxyReq = http.request(
     {
       host: '127.0.0.1',
       port: HLS_HTTP_PORT,
       path: targetPath,
       method: req.method,
-      headers: { ...req.headers, host: `127.0.0.1:${HLS_HTTP_PORT}` },
+      headers,
+      timeout: HLS_PROXY_ORIGIN_TIMEOUT_MS,
     },
     (proxyRes: IncomingMessage) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
@@ -117,9 +148,20 @@ app.use('/live', (req: Request, res: Response) => {
     },
   );
 
+  proxyReq.on('timeout', () => {
+    log('HLS proxy origin timeout', { path: targetPath, ms: HLS_PROXY_ORIGIN_TIMEOUT_MS });
+    proxyReq.destroy();
+    if (!res.headersSent) res.status(504).end();
+  });
+
   proxyReq.on('error', (err: Error & { code?: string; syscall?: string }) => {
     log('HLS proxy error', { path: targetPath, message: err.message, code: err.code, syscall: err.syscall });
     if (!res.headersSent) res.status(502).end();
+  });
+
+  req.on('aborted', () => proxyReq.destroy());
+  res.on('close', () => {
+    if (!res.writableEnded) proxyReq.destroy();
   });
 
   proxyReq.end();
@@ -130,15 +172,7 @@ app.get('/health', async (_req: Request, res: Response) => {
   let hlsStatus: string = 'not_checked';
 
   if (ENABLE_RTMP_SERVER) {
-    hlsReachable = await new Promise<boolean>((resolve) => {
-      const probe = http.request(
-        { host: '127.0.0.1', port: HLS_HTTP_PORT, path: '/', method: 'GET', timeout: 2000 },
-        () => resolve(true),
-      );
-      probe.on('error', () => resolve(false));
-      probe.on('timeout', () => { probe.destroy(); resolve(false); });
-      probe.end();
-    });
+    hlsReachable = await probeHlsInternal();
     hlsStatus = hlsReachable ? 'reachable' : 'unreachable';
   }
 
@@ -149,6 +183,7 @@ app.get('/health', async (_req: Request, res: Response) => {
     modes: {
       wsIngest: ENABLE_WS_INGEST,
       rtmpServer: ENABLE_RTMP_SERVER,
+      cfStreamMode: CF_STREAM_MODE,
     },
     ports: {
       http: PORT,
@@ -158,10 +193,71 @@ app.get('/health', async (_req: Request, res: Response) => {
     hls: {
       port: HLS_HTTP_PORT,
       status: hlsStatus,
+      variant: ENABLE_RTMP_SERVER ? HLS_VARIANT : null,
+      segmentDuration: ENABLE_RTMP_SERVER ? HLS_SEGMENT_DURATION : null,
+      partDuration: ENABLE_RTMP_SERVER && HLS_IS_LOW_LATENCY ? HLS_PART_DURATION : null,
     },
-    activeStreams: clients.size,
+    capacity: {
+      activeWsIngests: clients.size,
+      maxConcurrentWsIngests: MAX_CONCURRENT_WS_STREAMS || null,
+    },
   });
 });
+
+// For orchestrators: fail readiness when MediaMTX HLS is required but down
+app.get('/ready', async (_req: Request, res: Response) => {
+  if (!ENABLE_RTMP_SERVER) {
+    return res.status(200).json({ ready: true, reason: 'rtmp_server_disabled' });
+  }
+  const ok = await probeHlsInternal();
+  if (!ok) {
+    return res.status(503).json({ ready: false, reason: 'hls_origin_unreachable' });
+  }
+  return res.status(200).json({ ready: true, activeWsIngests: clients.size });
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Avoid name clash with Express `Response` type */
+type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit & { timeoutMs?: number } = {},
+): Promise<FetchResponse> {
+  const timeoutMs = init.timeoutMs ?? API_FETCH_TIMEOUT_MS;
+  const { timeoutMs: _t, ...rest } = init;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    return await globalThis.fetch(url, { ...rest, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Strip hop-by-hop headers so Node proxy → MediaMTX behaves predictably */
+function sanitizeProxyHeaders(raw: IncomingMessage['headers']): Record<string, string | string[] | undefined> {
+  const out: Record<string, string | string[] | undefined> = { ...raw };
+  const drop = ['host', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer'];
+  for (const k of drop) delete out[k];
+  return out;
+}
+
+async function probeHlsInternal(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const probe = http.request(
+      { host: '127.0.0.1', port: HLS_HTTP_PORT, path: '/', method: 'GET', timeout: 2000 },
+      () => resolve(true),
+    );
+    probe.on('error', () => resolve(false));
+    probe.on('timeout', () => {
+      probe.destroy();
+      resolve(false);
+    });
+    probe.end();
+  });
+}
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 const log = (message: string, meta?: Record<string, unknown>) => {
@@ -176,7 +272,7 @@ const log = (message: string, meta?: Record<string, unknown>) => {
 // ── Backend API helpers ───────────────────────────────────────────────────────
 const validateIngestKey = async (videoId: string, key: string): Promise<WsValidationResponse> => {
   const url = `${API_BASE_URL}/live/ingest/validate/${encodeURIComponent(videoId)}?key=${encodeURIComponent(key)}`;
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: 'GET',
     headers: { 'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET },
   });
@@ -191,7 +287,7 @@ const validateIngestKey = async (videoId: string, key: string): Promise<WsValida
 
 const validateRtmpStreamKey = async (streamKey: string) => {
   const url = `${API_BASE_URL}/live/rtmp/validate/${encodeURIComponent(streamKey)}`;
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: { 'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET },
   });
 
@@ -210,19 +306,30 @@ const notifyIngestEvent = async (payload: {
   source: 'ws' | 'rtmp';
   reason?: string;
 }) => {
-  const response = await fetch(`${API_BASE_URL}/live/ingest/events`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => 'unknown error');
-    throw new Error(`ingest event failed: ${response.status} ${text}`);
+  const url = `${API_BASE_URL}/live/ingest/events`;
+  const body = JSON.stringify(payload);
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= INGEST_EVENT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-live-ingest-secret': LIVE_INGEST_SHARED_SECRET,
+        },
+        body,
+      });
+      if (response.ok) return;
+      const text = await response.text().catch(() => 'unknown error');
+      lastErr = new Error(`ingest event failed: ${response.status} ${text}`);
+    } catch (e: any) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+    }
+    if (attempt < INGEST_EVENT_MAX_ATTEMPTS) {
+      await sleep(400 * attempt);
+    }
   }
+  throw lastErr ?? new Error('ingest event failed');
 };
 
 // ── Cloudflare Stream API ─────────────────────────────────────────────────────
@@ -247,9 +354,10 @@ const cfHeaders = () => ({
 });
 
 const createCfLiveInput = async (videoId: string): Promise<CfLiveInput> => {
-  const response = await fetch(cfApiBase(), {
+  const response = await fetchWithTimeout(cfApiBase(), {
     method:  'POST',
     headers: cfHeaders(),
+    timeoutMs: 45_000,
     body: JSON.stringify({
       meta:              { name: `videomanch-${videoId}` },
       recording:         { mode: 'automatic' },  // auto-record for VOD replay
@@ -280,9 +388,10 @@ const createCfLiveInput = async (videoId: string): Promise<CfLiveInput> => {
 };
 
 const deleteCfLiveInput = async (uid: string): Promise<void> => {
-  const response = await fetch(`${cfApiBase()}/${uid}`, {
+  const response = await fetchWithTimeout(`${cfApiBase()}/${uid}`, {
     method:  'DELETE',
     headers: cfHeaders(),
+    timeoutMs: 20_000,
   });
   if (!response.ok) {
     const text = await response.text().catch(() => 'unknown');
@@ -447,12 +556,12 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp
         '-tune', 'zerolatency',
         '-pix_fmt', 'yuv420p',
         '-threads', '2',
-        '-r', '30',               // force constant 30fps output — needed for stable keyframes from WebM pipe
-        '-vsync', 'cfr',          // constant frame rate — eliminates timestamp drift from browser encoder
-        '-g', '60',               // keyframe every 60 frames = 2s at 30fps (matches hlsSegmentDuration=2s)
-        '-keyint_min', '60',      // minimum keyframe interval — prevents scene-cut keyframes
-        '-x264-params', 'scenecut=0',  // disable scene-cut detection — keyframes at exact intervals only
-        // Target 1500 kbps video → 2s segment ≈ 375 KB (200–450 KB range)
+        '-r', String(HLS_FPS),
+        '-vsync', 'cfr',
+        // GOP aligned to MediaMTX hlsSegmentDuration (see HLS_SEGMENT_SEC)
+        '-g', String(HLS_GOP_FRAMES),
+        '-keyint_min', String(HLS_GOP_FRAMES),
+        '-x264-params', 'scenecut=0',
         '-b:v', '1500k',
         '-maxrate', '2000k',
         '-bufsize', '4000k',
@@ -475,7 +584,14 @@ const startFfmpeg = (rtmpUrl: string, streamKey: string, container: 'webm' | 'mp
     target,
   ];
 
-  log('Starting ffmpeg process', { target, ffmpegBin: FFMPEG_BIN });
+  log('Starting ffmpeg process', {
+    target,
+    ffmpegBin: FFMPEG_BIN,
+    container,
+    h264Passthrough: isH264Input,
+    gopFrames: isH264Input ? 'copy' : HLS_GOP_FRAMES,
+    fps: isH264Input ? 'source' : HLS_FPS,
+  });
   const proc = spawn(FFMPEG_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   const stderrTail: string[] = [];
 
@@ -543,6 +659,16 @@ server.on('upgrade', async (request: IncomingMessage, socket: Socket, head: Buff
     const videoId = match[1];
     const key = parsed.searchParams.get('key') || '';
     const container = parsed.searchParams.get('container') === 'mp4' ? 'mp4' : 'webm';
+
+    if (MAX_CONCURRENT_WS_STREAMS > 0 && clients.size >= MAX_CONCURRENT_WS_STREAMS) {
+      log('Upgrade rejected — at concurrent WebSocket ingest capacity', {
+        cap: MAX_CONCURRENT_WS_STREAMS,
+        active: clients.size,
+      });
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     if (!key) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -771,9 +897,15 @@ const spawnMediaMTX = (configPath: string, restartDelay = 3000, attempt = 1) => 
   });
 };
 
-const buildMediaMTXConfig = (): string => `
+const buildMediaMTXConfig = (): string => {
+  const partBlock = HLS_IS_LOW_LATENCY ? `hlsPartDuration: ${HLS_PART_DURATION}\n` : '';
+  const alwaysRemuxLine = HLS_ALWAYS_REMUX ? 'hlsAlwaysRemux: yes\n' : '';
+  return `
 logLevel: info
 logDestinations: [stdout]
+readTimeout: ${MEDIAMTX_READ_TIMEOUT}
+writeTimeout: ${MEDIAMTX_WRITE_TIMEOUT}
+writeQueueSize: 1024
 
 authMethod: http
 authHTTPAddress: http://127.0.0.1:${PORT}/mediamtx/auth
@@ -794,10 +926,10 @@ rtmpAddress: :${RTMP_PORT}
 hls: yes
 hlsAddress: :${HLS_HTTP_PORT}
 hlsAllowOrigin: "*"
-hlsSegmentCount: 15
-hlsSegmentDuration: 2s
-hlsPartDuration: 1s
-
+${alwaysRemuxLine}hlsVariant: ${HLS_VARIANT}
+hlsSegmentCount: ${HLS_SEGMENT_COUNT}
+hlsSegmentDuration: ${HLS_SEGMENT_DURATION}
+${partBlock}
 paths:
   "~^live/":
     runOnReady: >
@@ -810,6 +942,7 @@ paths:
       -H "Content-Type: application/json"
       -d "{\\"path\\":\\"$MTX_PATH\\",\\"id\\":\\"$MTX_ID\\"}"
 `.trimStart();
+};
 
 const startMediaMTX = () => {
   if (!ENABLE_RTMP_SERVER) return;
@@ -826,6 +959,15 @@ const startMediaMTX = () => {
   fs.writeFileSync(resolvedConfig, buildMediaMTXConfig(), 'utf8');
 
   log('MediaMTX detected', { bin: MEDIAMTX_BIN, version, config: resolvedConfig });
+  log('MediaMTX HLS tuning', {
+    variant: HLS_VARIANT,
+    segmentDuration: HLS_SEGMENT_DURATION,
+    partDuration: HLS_IS_LOW_LATENCY ? HLS_PART_DURATION : 'n/a',
+    segmentCount: HLS_SEGMENT_COUNT,
+    alwaysRemux: HLS_ALWAYS_REMUX,
+    wsFfmpegGopFrames: HLS_GOP_FRAMES,
+    wsFfmpegFps: HLS_FPS,
+  });
   spawnMediaMTX(resolvedConfig);
   log('MediaMTX started', { rtmpPort: RTMP_PORT, hlsHttpPort: HLS_HTTP_PORT });
 };
