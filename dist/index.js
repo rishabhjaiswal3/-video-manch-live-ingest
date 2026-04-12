@@ -4,9 +4,11 @@ import http from 'http';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { URL } from 'node:url';
 import { WebSocketServer } from 'ws';
+import { acquirePublisherLock, LOCK_REFRESH_MS, refreshPublisherLock, releasePublisherLock } from './redisLock.js';
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT = Number(process.env.PORT || 3001);
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.videomanch.com';
@@ -45,6 +47,8 @@ const HLS_PROXY_ORIGIN_TIMEOUT_MS = Math.min(600_000, Math.max(30_000, Number.pa
 const MEDIAMTX_READ_TIMEOUT = (process.env.MEDIAMTX_READ_TIMEOUT || '60s').trim();
 const MEDIAMTX_WRITE_TIMEOUT = (process.env.MEDIAMTX_WRITE_TIMEOUT || '60s').trim();
 const INGEST_EVENT_MAX_ATTEMPTS = Math.min(6, Math.max(1, Number.parseInt(process.env.INGEST_EVENT_MAX_ATTEMPTS || '3', 10) || 3));
+/** Per-IP sliding window for WebSocket upgrade attempts (abuse throttle at origin). */
+const WS_UPGRADE_RATE_PER_MINUTE_IP = Math.max(5, Number.parseInt(process.env.WS_UPGRADE_RATE_PER_MINUTE_IP || '40', 10) || 40);
 // MediaMTX binary path
 const MEDIAMTX_BIN = process.env.MEDIAMTX_BIN || 'mediamtx';
 // ── Cloudflare Stream mode ────────────────────────────────────────────────────
@@ -178,6 +182,25 @@ app.get('/ready', async (_req, res) => {
     }
     return res.status(200).json({ ready: true, activeWsIngests: clients.size });
 });
+// Minimal Prometheus text for Railway / Grafana Agent scrapers
+app.get('/metrics', (_req, res) => {
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    const lines = [
+        '# HELP vm_live_ingest_active_ws Active browser WebSocket ingest publishers',
+        '# TYPE vm_live_ingest_active_ws gauge',
+        `vm_live_ingest_active_ws ${clients.size}`,
+        '# HELP vm_live_ingest_cf_stream_mode 1 if CF_STREAM_MODE',
+        '# TYPE vm_live_ingest_cf_stream_mode gauge',
+        `vm_live_ingest_cf_stream_mode ${CF_STREAM_MODE ? 1 : 0}`,
+        '# HELP vm_live_ingest_rtmp_enabled 1 if local MediaMTX RTMP+HLS is enabled',
+        '# TYPE vm_live_ingest_rtmp_enabled gauge',
+        `vm_live_ingest_rtmp_enabled ${ENABLE_RTMP_SERVER ? 1 : 0}`,
+        '# HELP vm_live_ingest_ws_cap Configured max concurrent WS ingests (0 = unlimited)',
+        '# TYPE vm_live_ingest_ws_cap gauge',
+        `vm_live_ingest_ws_cap ${MAX_CONCURRENT_WS_STREAMS}`,
+    ];
+    res.status(200).send(`${lines.join('\n')}\n`);
+});
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function fetchWithTimeout(url, init = {}) {
     const timeoutMs = init.timeoutMs ?? API_FETCH_TIMEOUT_MS;
@@ -219,6 +242,18 @@ const log = (message, meta) => {
     }
     console.log(`[LIVE-INGEST][${ts}] ${message}`);
 };
+const wsUpgradeTimestampsByIp = new Map();
+function allowWsUpgradeForIp(ip) {
+    const now = Date.now();
+    const windowMs = 60_000;
+    const arr = (wsUpgradeTimestampsByIp.get(ip) || []).filter((t) => now - t < windowMs);
+    if (arr.length >= WS_UPGRADE_RATE_PER_MINUTE_IP) {
+        return false;
+    }
+    arr.push(now);
+    wsUpgradeTimestampsByIp.set(ip, arr);
+    return true;
+}
 // ── Backend API helpers ───────────────────────────────────────────────────────
 const validateIngestKey = async (videoId, key) => {
     const url = `${API_BASE_URL}/live/ingest/validate/${encodeURIComponent(videoId)}?key=${encodeURIComponent(key)}`;
@@ -360,7 +395,13 @@ app.post('/mediamtx/on-publish', async (req, res) => {
         const streamPath = String(req.body?.path || '');
         const streamKey = streamPath.split('/').pop() || '';
         log('MediaMTX on-publish', { streamPath, streamKey });
-        notifyIngestEvent({ event: 'ingest_started', streamKey, source: 'rtmp' }).catch((err) => {
+        const mtxId = String(req.body?.id || '');
+        notifyIngestEvent({
+            event: 'ingest_started',
+            streamKey,
+            source: 'rtmp',
+            idempotencyKey: mtxId ? `rtmp:${streamKey}:${mtxId}:ingest_started` : undefined,
+        }).catch((err) => {
             log('Failed to notify ingest_started', { streamKey, message: err?.message });
         });
         return res.status(200).end();
@@ -378,7 +419,14 @@ app.post('/mediamtx/on-unpublish', async (req, res) => {
         const streamPath = String(req.body?.path || '');
         const streamKey = streamPath.split('/').pop() || '';
         log('MediaMTX on-unpublish', { streamPath, streamKey });
-        notifyIngestEvent({ event: 'ingest_stopped', streamKey, source: 'rtmp', reason: 'publish_ended' }).catch((err) => {
+        const mtxId = String(req.body?.id || '');
+        notifyIngestEvent({
+            event: 'ingest_stopped',
+            streamKey,
+            source: 'rtmp',
+            reason: 'publish_ended',
+            idempotencyKey: mtxId ? `rtmp:${streamKey}:${mtxId}:ingest_stopped` : undefined,
+        }).catch((err) => {
             log('Failed to notify ingest_stopped', { streamKey, message: err?.message });
         });
         return res.status(200).end();
@@ -515,6 +563,10 @@ const closeClient = (ws, code, reason) => {
     const state = clients.get(ws);
     if (state) {
         clearInterval(state.pingTimer);
+        if (state.lockRefreshTimer) {
+            clearInterval(state.lockRefreshTimer);
+        }
+        releasePublisherLock(state.streamKey).catch(() => { });
         if (!state.ffmpeg.killed) {
             try {
                 state.ffmpeg.stdin.end();
@@ -562,16 +614,39 @@ server.on('upgrade', async (request, socket, head) => {
             socket.destroy();
             return;
         }
+        const clientIp = request.socket.remoteAddress || 'unknown';
+        if (!allowWsUpgradeForIp(clientIp)) {
+            log('Upgrade rejected — WS upgrade rate limit', { videoId, clientIp });
+            socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+            socket.destroy();
+            return;
+        }
         log('Incoming ingest upgrade request', {
             videoId,
             hasKey: Boolean(key),
             origin: request.headers.origin || null,
-            ip: request.socket.remoteAddress || null,
+            ip: clientIp,
         });
         const validation = await validateIngestKey(videoId, key);
         if (!validation.success || !validation.data || !validation.data.isLive) {
             log('Ingest validation failed', { videoId, error: validation.error || 'invalid key/state' });
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+        const streamKeyForLock = validation.data.streamKey;
+        if (!streamKeyForLock) {
+            socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+        const lockOk = await acquirePublisherLock(streamKeyForLock);
+        if (!lockOk) {
+            log('Upgrade rejected — publisher lock held (use sticky sessions, one replica, or wait for TTL)', {
+                videoId,
+                streamKey: streamKeyForLock,
+            });
+            socket.write('HTTP/1.1 409 Conflict\r\n\r\n');
             socket.destroy();
             return;
         }
@@ -591,10 +666,12 @@ wsServer.on('connection', async (ws, _request, validationData, container = 'webm
         return;
     }
     const { videoId, streamKey, rtmpUrl } = validationData;
+    const ingestSessionId = randomUUID();
     // Reject duplicate streams for the same videoId
     const existingClient = Array.from(clients.values()).find(c => c.videoId === videoId);
     if (existingClient) {
         log('Duplicate stream attempt rejected', { videoId });
+        await releasePublisherLock(streamKey);
         ws.close(4009, 'stream_already_active');
         return;
     }
@@ -616,12 +693,14 @@ wsServer.on('connection', async (ws, _request, validationData, container = 'webm
             notifyIngestEvent({
                 event: 'ingest_started', videoId, streamKey, source: 'ws',
                 reason: `cf_playback_url:${liveInput.playbackUrl}`,
+                idempotencyKey: `${ingestSessionId}:ingest_started`,
             }).catch((error) => {
                 log('Failed to notify ingest start (CF mode)', { videoId, message: error?.message });
             });
         }
         catch (error) {
             log('Failed to create CF Stream live input — closing connection', { videoId, message: error?.message });
+            await releasePublisherLock(streamKey);
             ws.close(1011, 'cf_stream_init_failed');
             return;
         }
@@ -629,7 +708,13 @@ wsServer.on('connection', async (ws, _request, validationData, container = 'webm
     else {
         forwardRtmpUrl = resolveForwardRtmpUrl(rtmpUrl);
         ffmpegStreamKey = streamKey;
-        notifyIngestEvent({ event: 'ingest_started', videoId, streamKey, source: 'ws' }).catch((error) => {
+        notifyIngestEvent({
+            event: 'ingest_started',
+            videoId,
+            streamKey,
+            source: 'ws',
+            idempotencyKey: `${ingestSessionId}:ingest_started`,
+        }).catch((error) => {
             log('Failed to notify ingest start event', { videoId, streamKey, source: 'ws', message: error?.message });
         });
     }
@@ -665,7 +750,10 @@ wsServer.on('connection', async (ws, _request, validationData, container = 'webm
         }
         ws.ping();
     }, 15000);
-    clients.set(ws, { videoId, streamKey, ffmpeg, pingTimer });
+    const lockRefreshTimer = setInterval(() => {
+        refreshPublisherLock(streamKey).catch(() => { });
+    }, LOCK_REFRESH_MS);
+    clients.set(ws, { videoId, streamKey, ffmpeg, pingTimer, lockRefreshTimer });
     // ── Chunk timing diagnostics ──────────────────────────────────────────────
     // Logs every 30 chunks (~every 3s at 100ms MediaRecorder timeslice).
     // Watches for: large gaps between chunks (stalled MediaRecorder), tiny chunks
@@ -716,7 +804,14 @@ wsServer.on('connection', async (ws, _request, validationData, container = 'webm
         if (CF_STREAM_MODE && cfLiveInputUid) {
             deleteCfLiveInput(cfLiveInputUid).catch(() => { });
         }
-        notifyIngestEvent({ event: 'ingest_stopped', videoId, streamKey, source: 'ws', reason: reason.toString() || `ws_close_${code}` }).catch((error) => {
+        notifyIngestEvent({
+            event: 'ingest_stopped',
+            videoId,
+            streamKey,
+            source: 'ws',
+            reason: reason.toString() || `ws_close_${code}`,
+            idempotencyKey: `${ingestSessionId}:ingest_stopped`,
+        }).catch((error) => {
             log('Failed to notify ingest stop event', { videoId, streamKey, source: 'ws', message: error?.message });
         });
         closeClient(ws, 1000, 'client disconnected');

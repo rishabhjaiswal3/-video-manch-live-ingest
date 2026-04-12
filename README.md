@@ -65,18 +65,23 @@ MediaMTX emits **Low-Latency HLS** by default so **video-manch-player** (embedde
 | `MEDIAMTX_READ_TIMEOUT` | `60s` | MediaMTX global read timeout — **must** exceed LL-HLS blocking playlist wait (default 10s breaks live). |
 | `MEDIAMTX_WRITE_TIMEOUT` | `60s` | MediaMTX write timeout. |
 | `MAX_CONCURRENT_WS_STREAMS` | `0` | Cap browser-ingest WebSockets per process (`0` = unlimited). Set e.g. `48` for predictable RAM on small VMs. |
+| `REDIS_URL` | — | Optional. When set, **one publisher per stream key cluster-wide** via `SET NX` lock (multi-replica ingest). Same URL as API if you use Upstash. |
+| `LIVE_INGEST_LOCK_TTL_SEC` | `90` | Lock TTL if Redis is enabled; refreshed while the WebSocket is open. |
+| `LIVE_INGEST_LOCK_REFRESH_MS` | auto | Lock refresh interval (defaults to ~40% of TTL). |
+| `WS_UPGRADE_RATE_PER_MINUTE_IP` | `40` | In-memory sliding window per client IP for WebSocket upgrades (abuse throttle at origin). |
 
 ### Health checks for orchestration
 
 - `GET /health` — always 200; includes `hls.status` and `capacity.activeWsIngests`.
 - `GET /ready` — **503** if `ENABLE_RTMP_SERVER=true` and MediaMTX HLS port is unreachable (use for Kubernetes/Railway health).
+- `GET /metrics` — Prometheus text (`vm_live_ingest_active_ws`, mode flags, WS cap) for scrapers.
 
 ### Scaling beyond one instance (you must still do this in infra)
 
-1. **Ingest:** One active **WebSocket** publisher per `videoId` is enforced in code. Horizontal scale = many instances, **sticky routing** or **one stream key → one instance** (Redis coordination not in this repo).
+1. **Ingest:** One active **WebSocket** publisher per `videoId` is enforced per process. With **multiple replicas**, set **`REDIS_URL`** so only one instance holds the publisher lock per `streamKey`, or use **sticky sessions** / stream-key sharding at the load balancer.
 2. **Viewers:** Use **video-manch-live-hls-worker** (Cloudflare) in front of origin; increase origin RAM/CPU or enable **CF_STREAM_MODE** for CDN-native live.
-3. **OBS RTMP:** Put **MediaMTX** (or this service with `ENABLE_RTMP_SERVER`) behind TCP load balancer; each publisher still lands on one node.
-4. **Database / API:** watch-backend must stay fast on `/live/*` validate and events (rate limits, indexes on `streamKey`).
+3. **OBS RTMP:** Put **MediaMTX** (or this service with `ENABLE_RTMP_SERVER`) behind TCP load balancer; each publisher still lands on one node (sticky TCP or single origin).
+4. **Database / API:** Main API implements **`POST /live/ingest/events`**, rate limits on validate/events, Redis-backed idempotency when `REDIS_URL` is set on the API.
 
 ## Backend Requirements
 
